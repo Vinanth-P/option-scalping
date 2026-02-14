@@ -125,6 +125,12 @@ class Position:
     put_premium: float = 0
     total_hedging_cost: float = 0
     total_pnl: float = 0
+    hedge_trades: list = None  # List of (qty, entry_price) tuples for FIFO tracking
+    
+    def __post_init__(self):
+        """Initialize mutable defaults"""
+        if self.hedge_trades is None:
+            self.hedge_trades = []
 
 
 class GammaScalpingStrategy:
@@ -251,9 +257,25 @@ class GammaScalpingStrategy:
         """Check if should rehedge delta"""
         return abs(portfolio_delta) > self.delta_threshold
     
+    def calculate_futures_pnl(self, exit_spot: float) -> float:
+        """
+        Calculate futures PnL using FIFO accounting
+        Sums P&L from all individual hedge trades
+        """
+        if self.position is None or not self.position.hedge_trades:
+            return 0
+        
+        total_pnl = 0
+        for qty, entry_price in self.position.hedge_trades:
+            # Each trade's PnL: quantity × (exit_price - entry_price)
+            total_pnl += qty * (exit_spot - entry_price)
+        
+        return total_pnl
+    
     def rehedge_delta(self, spot: float, portfolio_delta: float, greeks: Dict) -> float:
         """
         Rehedge portfolio delta by trading futures
+        Records each hedge trade individually for FIFO accounting
         Returns hedging cost/profit
         """
         if self.position is None:
@@ -265,6 +287,10 @@ class GammaScalpingStrategy:
         
         # Calculate change in hedge position
         delta_hedge = required_hedge - self.position.futures_qty
+        
+        # Record this hedge trade for FIFO tracking
+        if abs(delta_hedge) > 0.001:  # Only record if meaningful change
+            self.position.hedge_trades.append((delta_hedge, spot))
         
         # Hedging cost (we're buying/selling at current price)
         # Positive cost = paying to hedge, negative = profiting from hedge
@@ -278,7 +304,7 @@ class GammaScalpingStrategy:
     def enter_position(self, timestamp: datetime, spot: float, iv: float) -> None:
         """Enter new straddle position"""
         strike = self.get_atm_strike(spot)
-        T = self.time_to_expiry / 365
+        T = self.time_to_expiry / 365  # Initial time to expiry
         
         # Calculate option prices
         call_price = BlackScholes.call_price(spot, strike, T, self.risk_free_rate, iv/100)
@@ -316,14 +342,16 @@ class GammaScalpingStrategy:
             return 0
         
         strike = self.position.strike
-        T = max(0, (self.position.entry_time + timedelta(days=self.time_to_expiry) - timestamp).days / 365)
+        # Calculate time decay using continuous intraday calculation
+        time_elapsed = (timestamp - self.position.entry_time).total_seconds() / (365 * 24 * 3600)
+        T = max(0.0001, (self.time_to_expiry / 365) - time_elapsed)
         
         # Current option values
         call_value = BlackScholes.call_price(spot, strike, T, self.risk_free_rate, iv/100)
         put_value = BlackScholes.put_price(spot, strike, T, self.risk_free_rate, iv/100)
         
-        # Close futures hedge
-        futures_pnl = self.position.futures_qty * (spot - self.position.entry_price)
+        # Close futures hedge using FIFO accounting
+        futures_pnl = self.calculate_futures_pnl(spot)
         
         # Total P&L
         options_pnl = (call_value + put_value) - (self.position.call_premium + self.position.put_premium)
@@ -354,17 +382,31 @@ class GammaScalpingStrategy:
         """
         results = []
         
-        # Calculate returns and historical volatility
+        # Calculate returns for fallback
         price_data['returns'] = price_data['close'].pct_change()
-        price_data['hist_vol'] = self.calculate_historical_iv(price_data['returns'], window=20)
-        price_data['implied_vol'] = price_data['hist_vol'] * 1.2  # Simplified IV estimate
+        
+        # **CRITICAL FIX #1: Use real IV from CSV data**
+        if 'iv' in price_data.columns and not price_data['iv'].isna().all():
+            # Use real IV from CSV (primary source)
+            price_data['implied_vol'] = price_data['iv']
+            
+            # Fill missing values with interpolation
+            price_data['implied_vol'] = price_data['implied_vol'].interpolate(method='linear')
+            price_data['implied_vol'].fillna(method='bfill', inplace=True)
+            price_data['implied_vol'].fillna(method='ffill', inplace=True)
+            
+            # Fallback to historical vol only if still NaN
+            price_data['hist_vol'] = self.calculate_historical_iv(price_data['returns'], window=20)
+            price_data['implied_vol'].fillna(price_data['hist_vol'] * 1.2, inplace=True)
+        else:
+            # Fallback: calculate historical volatility (only if no IV column)
+            price_data['hist_vol'] = self.calculate_historical_iv(price_data['returns'], window=20)
+            price_data['implied_vol'] = price_data['hist_vol'] * 1.2  # Simplified IV estimate
         
         # Ensure IV is never zero or NaN (which would cause division by zero in Greeks)
         # Replace zero/NaN with a minimum viable IV (10%)
         price_data['implied_vol'] = price_data['implied_vol'].replace(0, 10)
         price_data['implied_vol'] = price_data['implied_vol'].fillna(10)
-        price_data['hist_vol'] = price_data['hist_vol'].replace(0, 10)
-        price_data['hist_vol'] = price_data['hist_vol'].fillna(10)
         
         for idx, row in price_data.iterrows():
             if pd.isna(row['hist_vol']) or pd.isna(row['implied_vol']):
@@ -381,9 +423,9 @@ class GammaScalpingStrategy:
                 if self.should_enter(iv, iv_history):
                     self.enter_position(timestamp, spot, iv)
             else:
-                # Calculate current position value and Greeks
-                days_held = (timestamp - self.position.entry_time).days
-                T = max(0, (self.time_to_expiry - days_held) / 365)
+                # Calculate current position value and Greeks with continuous time decay
+                time_elapsed = (timestamp - self.position.entry_time).total_seconds() / (365 * 24 * 3600)
+                T = max(0.0001, (self.time_to_expiry / 365) - time_elapsed)
                 
                 greeks = self.calculate_position_greeks(spot, self.position.strike, T, iv)
                 
@@ -391,7 +433,7 @@ class GammaScalpingStrategy:
                 call_value = BlackScholes.call_price(spot, self.position.strike, T, self.risk_free_rate, iv/100)
                 put_value = BlackScholes.put_price(spot, self.position.strike, T, self.risk_free_rate, iv/100)
                 options_pnl = (call_value + put_value) - (self.position.call_premium + self.position.put_premium)
-                futures_pnl = self.position.futures_qty * (spot - self.position.entry_price)
+                futures_pnl = self.calculate_futures_pnl(spot)  # Use FIFO accounting
                 total_pnl = options_pnl + futures_pnl + self.position.total_hedging_cost
                 
                 # Avoid division by zero - if premium is 0, treat as 0% P&L
