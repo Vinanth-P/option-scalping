@@ -165,7 +165,7 @@ max_loss = st.sidebar.slider(
 
 time_to_expiry = st.sidebar.slider(
     "Days to Expiry",
-    min_value=2,
+    min_value=1,
     max_value=21,
     value=7,
     step=1,
