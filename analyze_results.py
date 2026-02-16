@@ -245,17 +245,17 @@ def analyze_hedging_efficiency(trade_log_file='gamma_scalping_trades.csv'):
         total_futures_pnl = exits['futures_pnl'].sum() if 'futures_pnl' in exits else 0
         total_hedging_cost = exits['hedging_cost'].sum() if 'hedging_cost' in exits else 0
         
-        print(f"\nP&L Breakdown:")
+        print(f"\n  💰 P&L Breakdown:")
         print(f"  Options P&L: ₹{total_options_pnl:,.2f}")
-        print(f"  Futures P&L: ₹{total_futures_pnl:,.2f}")
-        print(f"  Hedging Costs: ₹{total_hedging_cost:,.2f}")
-        print(f"  Total P&L: ₹{(total_options_pnl + total_futures_pnl + total_hedging_cost):,.2f}")
+        print(f"  Futures P&L (FIFO): ₹{total_futures_pnl:,.2f}")
+        print(f"  Hedging Costs (legacy field, not used): ₹{total_hedging_cost:,.2f}")
+        print(f"  Total P&L: ₹{(total_options_pnl + total_futures_pnl):,.2f}")  # FIFO already includes all hedge economics
         
-        print(f"\nHedging Contribution:")
-        total_pnl = total_options_pnl + total_futures_pnl + total_hedging_cost
+        # Contribution analysis (FIFO futures_pnl includes all hedge economics)
+        total_pnl = total_options_pnl + total_futures_pnl
         if total_pnl != 0:
-            hedge_contrib = (total_futures_pnl + total_hedging_cost) / total_pnl * 100
-            print(f"  Hedging contributed {hedge_contrib:.1f}% of total P&L")
+            hedge_contrib = total_futures_pnl / total_pnl * 100
+            print(f"  Hedging Contribution: {hedge_contrib:.1f}%")
         
         if len(hedges) > 0:
             trades_count = len(exits)

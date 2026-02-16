@@ -292,14 +292,10 @@ class GammaScalpingStrategy:
         if abs(delta_hedge) > 0.001:  # Only record if meaningful change
             self.position.hedge_trades.append((delta_hedge, spot))
         
-        # Hedging cost (we're buying/selling at current price)
-        # Positive cost = paying to hedge, negative = profiting from hedge
-        hedging_pnl = -delta_hedge * spot  # Negative because we're taking opposite position
-        
+        # Update futures position (FIFO accounting in calculate_futures_pnl handles P&L)
         self.position.futures_qty = required_hedge
-        self.position.total_hedging_cost += hedging_pnl
         
-        return hedging_pnl
+        return 0  # P&L calculated via FIFO, not incremental cost
     
     def enter_position(self, timestamp: datetime, spot: float, iv: float) -> None:
         """Enter new straddle position"""
@@ -353,9 +349,9 @@ class GammaScalpingStrategy:
         # Close futures hedge using FIFO accounting
         futures_pnl = self.calculate_futures_pnl(spot)
         
-        # Total P&L
+        # Total P&L (FIFO futures_pnl already includes all hedge economics)
         options_pnl = (call_value + put_value) - (self.position.call_premium + self.position.put_premium)
-        total_pnl = options_pnl + futures_pnl + self.position.total_hedging_cost
+        total_pnl = options_pnl + futures_pnl
         
         self.trade_log.append({
             'timestamp': timestamp,
@@ -381,6 +377,11 @@ class GammaScalpingStrategy:
         price_data should have columns: ['timestamp', 'close', 'high', 'low']
         """
         results = []
+        
+        # Track previous values for Greeks P&L attribution
+        prev_spot = None
+        prev_iv = None
+        prev_timestamp = None
         
         # Calculate returns for fallback
         price_data['returns'] = price_data['close'].pct_change()
@@ -434,7 +435,7 @@ class GammaScalpingStrategy:
                 put_value = BlackScholes.put_price(spot, self.position.strike, T, self.risk_free_rate, iv/100)
                 options_pnl = (call_value + put_value) - (self.position.call_premium + self.position.put_premium)
                 futures_pnl = self.calculate_futures_pnl(spot)  # Use FIFO accounting
-                total_pnl = options_pnl + futures_pnl + self.position.total_hedging_cost
+                total_pnl = options_pnl + futures_pnl  # FIFO already includes all hedge economics
                 
                 # Avoid division by zero - if premium is 0, treat as 0% P&L
                 total_premium = self.position.call_premium + self.position.put_premium
@@ -460,6 +461,29 @@ class GammaScalpingStrategy:
                     final_pnl = self.exit_position(timestamp, spot, iv, reason)
                     self.pnl_history.append(final_pnl)
                 
+                # Calculate Greeks P&L Attribution
+                gamma_pnl = 0
+                vega_pnl = 0
+                theta_pnl = 0
+                
+                if prev_spot is not None and prev_iv is not None and prev_timestamp is not None:
+                    # Gamma P&L: 0.5 × gamma × (ΔS)^2
+                    delta_spot = spot - prev_spot
+                    gamma_pnl = 0.5 * greeks['gamma'] * (delta_spot ** 2)
+                    
+                    # Vega P&L: vega × ΔIV
+                    delta_iv = iv - prev_iv
+                    vega_pnl = greeks['vega'] * delta_iv
+                    
+                    # Theta P&L: theta × Δt (time in days)
+                    delta_time = (timestamp - prev_timestamp).total_seconds() / (24 * 3600)
+                    theta_pnl = greeks['theta'] * delta_time
+                
+                # Update previous values
+                prev_spot = spot
+                prev_iv = iv
+                prev_timestamp = timestamp
+                
                 # Record position metrics
                 if self.position:
                     results.append({
@@ -476,7 +500,11 @@ class GammaScalpingStrategy:
                         'futures_pnl': futures_pnl,
                         'hedging_cost': self.position.total_hedging_cost,
                         'total_pnl': total_pnl,
-                        'pnl_pct': pnl_pct
+                        'pnl_pct': pnl_pct,
+                        # Greeks P&L Attribution
+                        'gamma_pnl': gamma_pnl,
+                        'vega_pnl': vega_pnl,
+                        'theta_pnl': theta_pnl
                     })
         
         return pd.DataFrame(results)
@@ -634,6 +662,11 @@ def generate_performance_report(backtest_results: pd.DataFrame, trade_log: List[
         avg_win = np.mean([t['total_pnl'] for t in winning_trades]) if winning_trades else 0
         avg_loss = np.mean([t['total_pnl'] for t in losing_trades]) if losing_trades else 0
         
+        # Correct profit factor: sum(profits) / abs(sum(losses))
+        total_wins = sum([t['total_pnl'] for t in winning_trades]) if winning_trades else 0
+        total_losses = abs(sum([t['total_pnl'] for t in losing_trades])) if losing_trades else 0
+        profit_factor = total_wins / total_losses if total_losses != 0 else 0
+        
         report.append(f"\nTRADE STATISTICS:")
         report.append(f"  Total Trades: {num_trades}")
         report.append(f"  Winning Trades: {len(winning_trades)}")
@@ -641,7 +674,7 @@ def generate_performance_report(backtest_results: pd.DataFrame, trade_log: List[
         report.append(f"  Win Rate: {win_rate:.1f}%")
         report.append(f"  Average Win: ₹{avg_win:.2f}")
         report.append(f"  Average Loss: ₹{avg_loss:.2f}")
-        report.append(f"  Profit Factor: {abs(avg_win/avg_loss) if avg_loss != 0 else 0:.2f}")
+        report.append(f"  Profit Factor: {profit_factor:.2f}")
     
     # P&L statistics
     if pnl_history:

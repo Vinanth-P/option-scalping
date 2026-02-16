@@ -413,7 +413,11 @@ with tab1:
             total_pnl = sum(pnl_history) if pnl_history else 0
             avg_win = winning_trades['total_pnl'].mean() if len(winning_trades) > 0 else 0
             avg_loss = losing_trades['total_pnl'].mean() if len(losing_trades) > 0 else 0
-            profit_factor = abs(avg_win / avg_loss) if avg_loss != 0 else 0
+            
+            # Correct profit factor: sum(profits) / abs(sum(losses))
+            total_wins = winning_trades['total_pnl'].sum() if len(winning_trades) > 0 else 0
+            total_losses = abs(losing_trades['total_pnl'].sum()) if len(losing_trades) > 0 else 0
+            profit_factor = total_wins / total_losses if total_losses != 0 else 0
             
             # Drawdown calculation
             cumulative_pnl = results['total_pnl'].cumsum()
@@ -815,24 +819,85 @@ with tab4:
                 st.metric("Options P&L", f"₹{total_options_pnl:,.0f}")
             
             with col2:
-                st.metric("Futures P&L", f"₹{total_futures_pnl:,.0f}")
+                st.metric("Futures P&L (FIFO)", f"₹{total_futures_pnl:,.0f}")
             
             with col3:
-                st.metric("Hedging Costs", f"₹{total_hedging_cost:,.0f}")
+                st.metric("Hedging Cost (legacy)", f"₹{total_hedging_cost:,.0f}",
+                         help="Legacy field - not used. FIFO accounting already includes all hedge economics")
             
-            # Pie chart
+            # Pie chart (only options and futures, no hedging_cost as it's double counting)
             fig_components = go.Figure(data=[go.Pie(
-                labels=['Options P&L', 'Futures P&L', 'Hedging Costs'],
-                values=[abs(total_options_pnl), abs(total_futures_pnl), abs(total_hedging_cost)],
+                labels=['Options P&L', 'Futures P&L'],
+                values=[abs(total_options_pnl), abs(total_futures_pnl)],
                 hole=0.3
             )])
             
+            
             fig_components.update_layout(
-                title="P&L Components (Absolute Values)",
+                title="P&L Components (FIFO Accounting)",
                 height=400
             )
             
             st.plotly_chart(fig_components, use_container_width=True)
+        
+        # 🎯 GREEKS P&L ATTRIBUTION (Professional Analysis)
+        if 'gamma_pnl' in results.columns:
+            st.markdown("### 🎯 Greeks P&L Attribution (Skill vs Luck)")
+            
+            # Calculate cumulative attribution
+            cum_gamma_pnl = results['gamma_pnl'].sum()
+            cum_vega_pnl = results['vega_pnl'].sum()
+            cum_theta_pnl = results['theta_pnl'].sum()
+            
+            # Display attribution metrics
+            col1, col2, col3 = st.columns(3)
+            
+            with col1:
+                st.metric("Gamma P&L (Skill)", f"₹{cum_gamma_pnl:,.0f}",
+                         help="Profits from price movement scalping - repeatable skill")
+            
+            with col2:
+                st.metric("Vega P&L (Luck)", f"₹{cum_vega_pnl:,.0f}",
+                         help="Profits from IV changes - market luck, not scalable")
+            
+            with col3:
+                st.metric("Theta P&L (Cost)", f"₹{cum_theta_pnl:,.0f}",
+                         help="Time decay cost - always negative")
+            
+            # Attribution analysis
+            total_options = cum_gamma_pnl + cum_vega_pnl + cum_theta_pnl
+            if abs(total_options) > 0:
+                gamma_pct = (cum_gamma_pnl / abs(total_options)) * 100
+                vega_pct = (cum_vega_pnl / abs(total_options)) * 100
+                theta_pct = (cum_theta_pnl / abs(total_options)) * 100
+                
+                if gamma_pct > 60:
+                    st.success(f"✅ **Skill-Based**: {gamma_pct:.1f}% from gamma scalping - strategy is working!")
+                elif vega_pct > 50:
+                    st.warning(f"⚠️ **Luck-Based**: {vega_pct:.1f}% from vega - not repeatable/scalable")
+                else:
+                    st.info(f"📊 Mixed: Gamma {gamma_pct:.1f}% | Vega {vega_pct:.1f}% | Theta {theta_pct:.1f}%")
+            
+            # Waterfall chart showing attribution
+            fig_waterfall = go.Figure(go.Waterfall(
+                name="P&L Attribution",
+                orientation="v",
+                measure=["relative", "relative", "relative", "total"],
+                x=["Gamma<br>(Scalping)", "Vega<br>(IV Change)", "Theta<br>(Decay)", "Total<br>Options P&L"],
+                y=[cum_gamma_pnl, cum_vega_pnl, cum_theta_pnl, 0],
+                connector={"line": {"color": "rgb(63, 63, 63)"}},
+                decreasing={"marker": {"color": "red"}},
+                increasing={"marker": {"color": "green"}},
+                totals={"marker": {"color": "blue"}}
+            ))
+            
+            fig_waterfall.update_layout(
+                title="Options P&L Attribution Waterfall",
+                yaxis_title="P&L (₹)",
+                height=400
+            )
+            
+            st.plotly_chart(fig_waterfall, use_container_width=True)
         
     else:
         st.info("Run a backtest to view Greeks analysis")
