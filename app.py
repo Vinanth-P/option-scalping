@@ -425,26 +425,64 @@ with tab1:
             drawdown = cumulative_pnl - running_max
             max_drawdown = drawdown.min()
             
-            # Display metrics in columns
-            col1, col2, col3, col4, col5 = st.columns(5)
+            # Calculate gross P&L (without costs)
+            gross_options_pnl = trades_df['options_pnl'].sum() if 'options_pnl' in trades_df.columns else 0
+            gross_futures_pnl = trades_df['futures_pnl'].sum() if 'futures_pnl' in trades_df.columns else 0
+            gross_total_pnl = gross_options_pnl + gross_futures_pnl
+            
+            # Calculate costs
+            total_futures_comm = trades_df['futures_commission'].sum() if 'futures_commission' in trades_df.columns else 0
+            total_options_comm = trades_df['options_commission'].sum() if 'options_commission' in trades_df.columns else 0
+            total_slippage_cost = trades_df['total_slippage'].sum() if 'total_slippage' in trades_df.columns else 0
+            total_costs = total_futures_comm + total_options_comm + total_slippage_cost
+            
+            # Net P&L = Gross P&L - Costs
+            net_total_pnl = total_pnl  # Already calculated from pnl_history
+            
+            # Display P&L comparison prominently
+            st.markdown("### 💰 P&L Comparison: Gross vs Net (Realistic Costs)")
+            col1, col2, col3 = st.columns(3)
             
             with col1:
-                st.metric("Total P&L", f"₹{total_pnl:,.0f}", 
-                         delta=f"{(total_pnl/10000):.1f}% ROI" if total_pnl != 0 else None)
+                st.metric(
+                    "Gross P&L (No Costs)",
+                    f"₹{gross_total_pnl:,.0f}",
+                    delta=f"Options: ₹{gross_options_pnl:,.0f} | Futures: ₹{gross_futures_pnl:,.0f}"
+                )
             
             with col2:
+                cost_impact_pct = (total_costs / abs(gross_total_pnl) * 100) if gross_total_pnl != 0 else 0
+                st.metric(
+                    "Trading Costs",
+                    f"₹{total_costs:,.0f}",
+                    delta=f"-{cost_impact_pct:.1f}% impact",
+                    delta_color="inverse"
+                )
+            
+            with col3:
+                st.metric(
+                    "Net P&L (After Costs)",
+                    f"₹{net_total_pnl:,.0f}",
+                    delta=f"{(net_total_pnl/10000):.1f}% ROI" if net_total_pnl != 0 else None
+                )
+            
+            # Display other metrics in columns
+            st.markdown("### 📊 Performance Metrics")
+            col1, col2, col3, col4 = st.columns(4)
+            
+            with col1:
                 st.metric("Win Rate", f"{win_rate:.1f}%",
                          delta=f"{len(winning_trades)}/{num_trades} trades")
             
-            with col3:
+            with col2:
                 st.metric("Profit Factor", f"{profit_factor:.2f}",
                          delta="Good" if profit_factor > 1.5 else "Poor")
             
-            with col4:
+            with col3:
                 st.metric("Avg Win", f"₹{avg_win:,.0f}",
                          delta=f"Avg Loss: ₹{avg_loss:,.0f}")
             
-            with col5:
+            with col4:
                 st.metric("Max Drawdown", f"₹{max_drawdown:,.0f}",
                          delta=f"{(max_drawdown/total_pnl*100):.1f}%" if total_pnl != 0 else None,
                          delta_color="inverse")
