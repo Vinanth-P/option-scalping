@@ -114,7 +114,7 @@ class BlackScholes:
 
 @dataclass
 class Position:
-    """Track straddle position"""
+    """Track straddle position with realistic costs"""
     entry_time: datetime
     entry_price: float
     strike: float
@@ -126,6 +126,11 @@ class Position:
     total_hedging_cost: float = 0
     total_pnl: float = 0
     hedge_trades: list = None  # List of (qty, entry_price) tuples for FIFO tracking
+    # Realistic cost tracking
+    total_futures_commission: float = 0
+    total_options_commission: float = 0
+    total_slippage_cost: float = 0
+    num_rehedges: int = 0
     
     def __post_init__(self):
         """Initialize mutable defaults"""
@@ -153,6 +158,12 @@ class GammaScalpingStrategy:
         Days to expiry for options (e.g., 7 for weekly)
     risk_free_rate : float
         Annual risk-free rate for Greeks calculation
+    futures_commission : float
+        Commission per futures trade (₹ per lot)
+    options_commission : float
+        Commission per options trade (₹ per lot)
+    slippage_pct : float
+        Slippage as % of trade value (0.05-0.10%)
     """
     
     def __init__(self,
@@ -162,7 +173,10 @@ class GammaScalpingStrategy:
                  profit_target: float = 0.5,
                  max_loss: float = -0.3,
                  time_to_expiry: float = 7,
-                 risk_free_rate: float = 0.06):
+                 risk_free_rate: float = 0.06,
+                 futures_commission: float = 30.0,
+                 options_commission: float = 75.0,
+                 slippage_pct: float = 0.075):
         
         self.delta_threshold = delta_threshold
         self.iv_entry_percentile = iv_entry_percentile
@@ -171,6 +185,11 @@ class GammaScalpingStrategy:
         self.max_loss = max_loss
         self.time_to_expiry = time_to_expiry
         self.risk_free_rate = risk_free_rate
+        
+        # Realistic trading costs
+        self.futures_commission = futures_commission  # ₹30 per lot typical
+        self.options_commission = options_commission  # ₹75 per lot typical
+        self.slippage_pct = slippage_pct / 100  # Convert to decimal (0.075% = 0.00075)
         
         self.position: Position = None
         self.trade_log = []
@@ -276,7 +295,7 @@ class GammaScalpingStrategy:
         """
         Rehedge portfolio delta by trading futures
         Records each hedge trade individually for FIFO accounting
-        Returns hedging cost/profit
+        Returns hedging cost including commission and slippage
         """
         if self.position is None:
             return 0
@@ -288,25 +307,54 @@ class GammaScalpingStrategy:
         # Calculate change in hedge position
         delta_hedge = required_hedge - self.position.futures_qty
         
-        # Record this hedge trade for FIFO tracking
+        # Calculate realistic costs for this rehedge
+        hedge_cost = 0
         if abs(delta_hedge) > 0.001:  # Only record if meaningful change
+            # Commission cost
+            commission = self.futures_commission
+            
+            # Slippage cost (% of notional value)
+            notional = abs(delta_hedge) * spot
+            slippage = notional * self.slippage_pct
+            
+            # Total cost for this hedge
+            hedge_cost = commission + slippage
+            
+            # Track costs in position
+            self.position.total_futures_commission += commission
+            self.position.total_slippage_cost += slippage
+            self.position.num_rehedges += 1
+            
+            # Record this hedge trade for FIFO tracking
             self.position.hedge_trades.append((delta_hedge, spot))
         
         # Update futures position (FIFO accounting in calculate_futures_pnl handles P&L)
         self.position.futures_qty = required_hedge
         
-        return 0  # P&L calculated via FIFO, not incremental cost
+        return -hedge_cost  # Negative because it's a cost
     
     def enter_position(self, timestamp: datetime, spot: float, iv: float) -> None:
-        """Enter new straddle position"""
+        """Enter new straddle position with realistic costs"""
         strike = self.get_atm_strike(spot)
         T = self.time_to_expiry / 365  # Initial time to expiry
         
-        # Calculate option prices
+        # Calculate option prices (mid-price)
         call_price = BlackScholes.call_price(spot, strike, T, self.risk_free_rate, iv/100)
         put_price = BlackScholes.put_price(spot, strike, T, self.risk_free_rate, iv/100)
         
-        total_premium = call_price + put_price
+        # Add slippage to entry (buy at ask, which is higher than mid)
+        call_slippage = call_price * self.slippage_pct
+        put_slippage = put_price * self.slippage_pct
+        
+        # Actual entry prices including slippage
+        call_entry = call_price + call_slippage
+        put_entry = put_price + put_slippage
+        
+        # Options commission (per lot for both call and put)
+        options_commission = 2 * self.options_commission  # 2x for call + put
+        
+        total_premium = call_entry + put_entry
+        total_entry_slippage = call_slippage + put_slippage
         
         self.position = Position(
             entry_time=timestamp,
@@ -314,11 +362,13 @@ class GammaScalpingStrategy:
             strike=strike,
             call_qty=1,
             put_qty=1,
-            call_premium=call_price,
-            put_premium=put_price,
+            call_premium=call_entry,  # Includes entry slippage
+            put_premium=put_entry,    # Includes entry slippage
             futures_qty=0,
             total_hedging_cost=0,
-            total_pnl=0
+            total_pnl=0,
+            total_options_commission=options_commission,
+            total_slippage_cost=total_entry_slippage
         )
         
         self.trade_log.append({
@@ -329,11 +379,13 @@ class GammaScalpingStrategy:
             'call_price': call_price,
             'put_price': put_price,
             'total_premium': total_premium,
+            'entry_commission': options_commission,
+            'entry_slippage': total_entry_slippage,
             'iv': iv
         })
     
     def exit_position(self, timestamp: datetime, spot: float, iv: float, reason: str) -> float:
-        """Exit straddle position and calculate final P&L"""
+        """Exit straddle position and calculate final P&L with realistic costs"""
         if self.position is None:
             return 0
         
@@ -342,16 +394,39 @@ class GammaScalpingStrategy:
         time_elapsed = (timestamp - self.position.entry_time).total_seconds() / (365 * 24 * 3600)
         T = max(0.0001, (self.time_to_expiry / 365) - time_elapsed)
         
-        # Current option values
+        # Current option values (mid-price)
         call_value = BlackScholes.call_price(spot, strike, T, self.risk_free_rate, iv/100)
         put_value = BlackScholes.put_price(spot, strike, T, self.risk_free_rate, iv/100)
+        
+        # Exit slippage (sell at bid, which is lower than mid)
+        call_exit_slippage = call_value * self.slippage_pct
+        put_exit_slippage = put_value * self.slippage_pct
+        
+        # Actual exit values after slippage
+        call_exit = call_value - call_exit_slippage
+        put_exit = put_value - put_exit_slippage
+        
+        # Exit commission
+        exit_commission = 2 * self.options_commission  # 2x for call + put
         
         # Close futures hedge using FIFO accounting
         futures_pnl = self.calculate_futures_pnl(spot)
         
-        # Total P&L (FIFO futures_pnl already includes all hedge economics)
-        options_pnl = (call_value + put_value) - (self.position.call_premium + self.position.put_premium)
-        total_pnl = options_pnl + futures_pnl
+        # Add exit slippage to tracking
+        exit_slippage = call_exit_slippage + put_exit_slippage
+        self.position.total_slippage_cost += exit_slippage
+        self.position.total_options_commission += exit_commission
+        
+        # Calculate P&L components
+        options_pnl = (call_exit + put_exit) - (self.position.call_premium + self.position.put_premium)
+        
+        # Total costs
+        total_costs = (self.position.total_futures_commission + 
+                      self.position.total_options_commission + 
+                      self.position.total_slippage_cost)
+        
+        # Net P&L after all costs
+        total_pnl = options_pnl + futures_pnl - total_costs
         
         self.trade_log.append({
             'timestamp': timestamp,
@@ -362,7 +437,11 @@ class GammaScalpingStrategy:
             'put_value': put_value,
             'options_pnl': options_pnl,
             'futures_pnl': futures_pnl,
-            'hedging_cost': self.position.total_hedging_cost,
+            'futures_commission': self.position.total_futures_commission,
+            'options_commission': self.position.total_options_commission,
+            'total_slippage': self.position.total_slippage_cost,
+            'total_costs': total_costs,
+            'num_rehedges': self.position.num_rehedges,
             'total_pnl': total_pnl,
             'iv': iv
         })
@@ -644,7 +723,7 @@ def plot_results(backtest_results: pd.DataFrame, trade_log: List[Dict], price_da
 
 def generate_performance_report(backtest_results: pd.DataFrame, trade_log: List[Dict], 
                                 pnl_history: List[float]) -> str:
-    """Generate performance statistics report"""
+    """Generate performance statistics report with cost breakdown"""
     report = []
     report.append("=" * 70)
     report.append("GAMMA SCALPING STRATEGY - PERFORMANCE REPORT")
@@ -687,6 +766,24 @@ def generate_performance_report(backtest_results: pd.DataFrame, trade_log: List[
         report.append(f"  Max Single Trade Profit: ₹{max_profit:.2f}")
         report.append(f"  Max Single Trade Loss: ₹{max_loss:.2f}")
         report.append(f"  Average P&L per Trade: ₹{np.mean(pnl_history):.2f}")
+    
+    # Cost breakdown statistics
+    if trades:
+        total_futures_comm = sum([t.get('futures_commission', 0) for t in trades])
+        total_options_comm = sum([t.get('options_commission', 0) for t in trades])
+        total_slippage = sum([t.get('total_slippage', 0) for t in trades])
+        total_costs = total_futures_comm + total_options_comm + total_slippage
+        total_rehedges = sum([t.get('num_rehedges', 0) for t in trades])
+        
+        report.append(f"\nCOST BREAKDOWN (Realistic Trading Costs):")
+        report.append(f"  Total Futures Commission: ₹{total_futures_comm:.2f}")
+        report.append(f"  Total Options Commission: ₹{total_options_comm:.2f}")
+        report.append(f"  Total Slippage Cost: ₹{total_slippage:.2f}")
+        report.append(f"  ---")
+        report.append(f"  Total Trading Costs: ₹{total_costs:.2f}")
+        report.append(f"  Average Cost per Trade: ₹{total_costs/num_trades:.2f}")
+        if total_rehedges > 0:
+            report.append(f"  Average Cost per Rehedge: ₹{total_futures_comm/total_rehedges:.2f}")
     
     # Hedging statistics
     hedges = [t for t in trade_log if t.get('action') == 'REHEDGE']
