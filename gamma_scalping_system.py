@@ -755,35 +755,65 @@ def generate_performance_report(backtest_results: pd.DataFrame, trade_log: List[
         report.append(f"  Average Loss: ₹{avg_loss:.2f}")
         report.append(f"  Profit Factor: {profit_factor:.2f}")
     
-    # P&L statistics
-    if pnl_history:
-        total_pnl = sum(pnl_history)
-        max_profit = max(pnl_history)
-        max_loss = min(pnl_history)
-        
-        report.append(f"\nP&L STATISTICS:")
-        report.append(f"  Total P&L: ₹{total_pnl:.2f}")
-        report.append(f"  Max Single Trade Profit: ₹{max_profit:.2f}")
-        report.append(f"  Max Single Trade Loss: ₹{max_loss:.2f}")
-        report.append(f"  Average P&L per Trade: ₹{np.mean(pnl_history):.2f}")
-    
-    # Cost breakdown statistics
+    # Cost breakdown and comparison
     if trades:
+        # Calculate gross P&L (without costs)
+        gross_options_pnl = sum([t.get('options_pnl', 0) for t in trades])
+        gross_futures_pnl = sum([t.get('futures_pnl', 0) for t in trades])
+        gross_total_pnl = gross_options_pnl + gross_futures_pnl
+        
+        # Calculate costs
         total_futures_comm = sum([t.get('futures_commission', 0) for t in trades])
         total_options_comm = sum([t.get('options_commission', 0) for t in trades])
         total_slippage = sum([t.get('total_slippage', 0) for t in trades])
         total_costs = total_futures_comm + total_options_comm + total_slippage
-        total_rehedges = sum([t.get('num_rehedges', 0) for t in trades])
         
-        report.append(f"\nCOST BREAKDOWN (Realistic Trading Costs):")
-        report.append(f"  Total Futures Commission: ₹{total_futures_comm:.2f}")
-        report.append(f"  Total Options Commission: ₹{total_options_comm:.2f}")
-        report.append(f"  Total Slippage Cost: ₹{total_slippage:.2f}")
-        report.append(f"  ---")
-        report.append(f"  Total Trading Costs: ₹{total_costs:.2f}")
-        report.append(f"  Average Cost per Trade: ₹{total_costs/num_trades:.2f}")
+        # Calculate net P&L (with costs)
+        net_total_pnl = sum(pnl_history) if pnl_history else 0
+        
+        # Cost impact
+        cost_impact_pct = (total_costs / abs(gross_total_pnl) * 100) if gross_total_pnl != 0 else 0
+        
+        report.append(f"\n" + "=" * 70)
+        report.append("P&L COMPARISON: GROSS vs NET (With Realistic Trading Costs)")
+        report.append("=" * 70)
+        
+        report.append(f"\n📊 GROSS P&L (Without Trading Costs):")
+        report.append(f"  Options P&L:              ₹{gross_options_pnl:>10,.2f}")
+        report.append(f"  Futures P&L:              ₹{gross_futures_pnl:>10,.2f}")
+        report.append(f"  {'-' * 40}")
+        report.append(f"  Total GROSS P&L:          ₹{gross_total_pnl:>10,.2f}")
+        
+        report.append(f"\n💰 TRADING COSTS BREAKDOWN:")
+        report.append(f"  Futures Commission:       ₹{total_futures_comm:>10,.2f}")
+        report.append(f"  Options Commission:       ₹{total_options_comm:>10,.2f}")
+        report.append(f"  Slippage:                 ₹{total_slippage:>10,.2f}")
+        report.append(f"  {'-' * 40}")
+        report.append(f"  Total Costs:              ₹{total_costs:>10,.2f}")
+        
+        report.append(f"\n✅ NET P&L (After All Costs):")
+        report.append(f"  Total NET P&L:            ₹{net_total_pnl:>10,.2f}")
+        report.append(f"  Cost Impact:              {cost_impact_pct:>9.1f}%")
+        
+        report.append(f"\n📈 PER TRADE METRICS:")
+        report.append(f"  Avg Gross P&L per Trade:  ₹{gross_total_pnl/num_trades:>10,.2f}")
+        report.append(f"  Avg Cost per Trade:       ₹{total_costs/num_trades:>10,.2f}")
+        report.append(f"  Avg Net P&L per Trade:    ₹{net_total_pnl/num_trades:>10,.2f}")
+        
+        # Per-cost averages
+        total_rehedges = sum([t.get('num_rehedges', 0) for t in trades])
         if total_rehedges > 0:
-            report.append(f"  Average Cost per Rehedge: ₹{total_futures_comm/total_rehedges:.2f}")
+            report.append(f"\n  Total Rehedges:           {total_rehedges}")
+            report.append(f"  Avg Cost per Rehedge:     ₹{total_futures_comm/total_rehedges:>10,.2f}")
+    
+    # Additional statistics
+    if pnl_history:
+        max_profit = max(pnl_history)
+        max_loss = min(pnl_history)
+        
+        report.append(f"\nADDITIONAL STATISTICS:")
+        report.append(f"  Max Single Trade Profit: ₹{max_profit:.2f}")
+        report.append(f"  Max Single Trade Loss: ₹{max_loss:.2f}")
     
     # Hedging statistics
     hedges = [t for t in trade_log if t.get('action') == 'REHEDGE']
