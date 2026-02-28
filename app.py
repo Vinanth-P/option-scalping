@@ -92,23 +92,48 @@ def load_and_run(raw_df_bytes, fee, k_factor, cooldown):
     removed_sessions = total_raw_sessions - n_processed_sessions
     return df_trades, df_sessions, raw_df, removed_sessions
 
-using_synthetic = False
 default_file_path = "FINAL_NIFTY_MASTER_ATM.csv"
 
+# Determine data source label for sidebar
 if uploaded_file is not None:
-    df_trades, df_sessions, raw_df, removed_sessions = load_and_run(uploaded_file, fee_override, k_factor_override, cooldown_override)
+    data_source_label = f"📄 Uploaded: {uploaded_file.name}"
 elif os.path.exists(default_file_path):
-    st.sidebar.success(f"📂 Loaded provided data ({default_file_path})")
-    df_trades, df_sessions, raw_df, removed_sessions = load_and_run(default_file_path, fee_override, k_factor_override, cooldown_override)
+    data_source_label = f"📂 Default: {default_file_path}"
 else:
-    st.sidebar.warning("⚠️ No CSV uploaded and default data not found. Using synthetic sample data.")
-    using_synthetic = True
-    raw_df = generate_synthetic_data(n_sessions=30)
-    df_trades, df_sessions = build_dataframes(raw_df, fee=fee_override, k_factor=k_factor_override, cooldown_min=cooldown_override)
-    removed_sessions = 0
+    data_source_label = "🧪 Synthetic sample data"
+st.sidebar.caption(data_source_label)
 
-if using_synthetic:
-    st.warning("⚠️ Showing synthetic sample data. Upload your CSV to populate real results.")
+st.sidebar.markdown("---")
+run_backtest = st.sidebar.button("▶ Run Backtest", type="primary", use_container_width=True)
+
+# Initialize session state
+if "backtest_results" not in st.session_state:
+    st.session_state.backtest_results = None
+
+# Run backtest only when button is clicked
+if run_backtest:
+    using_synthetic = False
+    if uploaded_file is not None:
+        result = load_and_run(uploaded_file, fee_override, k_factor_override, cooldown_override)
+        st.session_state.backtest_results = result + (False,)  # (trades, sessions, raw, removed, synthetic)
+    elif os.path.exists(default_file_path):
+        result = load_and_run(default_file_path, fee_override, k_factor_override, cooldown_override)
+        st.session_state.backtest_results = result + (False,)
+    else:
+        raw_df_synth = generate_synthetic_data(n_sessions=30)
+        df_t, df_s = build_dataframes(raw_df_synth, fee=fee_override, k_factor=k_factor_override, cooldown_min=cooldown_override)
+        st.session_state.backtest_results = (df_t, df_s, raw_df_synth, 0, True)
+    st.sidebar.success("✅ Backtest complete!")
+
+# Load results from session state if available
+if st.session_state.backtest_results is not None:
+    df_trades, df_sessions, raw_df, removed_sessions, using_synthetic = st.session_state.backtest_results
+    if using_synthetic:
+        st.warning("⚠️ Showing synthetic sample data. Upload your CSV to populate real results.")
+else:
+    # No backtest run yet — show landing prompt
+    st.info("👈 Configure parameters in the sidebar, then click **▶ Run Backtest** to start.")
+    st.stop()
 
 # Date range filter
 if not df_sessions.empty and 'date' in df_sessions.columns:
