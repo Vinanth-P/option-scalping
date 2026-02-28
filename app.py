@@ -1,1029 +1,622 @@
-"""
-Gamma Scalping Strategy - Interactive Streamlit Dashboard
-
-This application provides an interactive interface for backtesting and analyzing
-the gamma scalping options trading strategy for Nifty options.
-"""
-
 import streamlit as st
 import pandas as pd
 import numpy as np
+import os
+import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-import io
-from datetime import datetime, timedelta
 
-# Import strategy modules
-from gamma_scalping_system import (
-    GammaScalpingStrategy, 
-    generate_sample_data,
-    generate_performance_report,
-    BlackScholes
+from backtest_engine import (
+    build_dataframes,
+    generate_synthetic_data,
+    run_parameter_sweep,
+    run_2d_sweep,
+    format_inr,
+    DEFAULT_FEE, DEFAULT_K, DEFAULT_COOLDOWN,
+    DEFAULT_MAX_HEDGES, DEFAULT_OPEN_FILTER, DEFAULT_IV_CRUSH,
 )
-from config import CONSERVATIVE, AGGRESSIVE, HIGH_FREQUENCY
 
-# Import API data fetcher
-try:
-    from api_data_fetcher import APIDataFetcher
-    API_AVAILABLE = True
-except ImportError:
-    API_AVAILABLE = False
-    st.warning("⚠️ API data fetcher not available. Install nsepy: pip install nsepy")
-
-# Page configuration
 st.set_page_config(
-    page_title="Gamma Scalping Strategy Dashboard",
-    page_icon="📈",
+    page_title="Nifty50 Gamma Scalp 1Min",
+    page_icon="⚡",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="expanded",
 )
 
-# Custom CSS for better styling
 st.markdown("""
-    <style>
-    .main {
-        padding: 0rem 1rem;
+<style>
+    header[data-testid="stHeader"] { background: transparent !important; }
+    .block-container { padding-top: 0rem !important; margin-top: 0rem !important; }
+    section[data-testid="stSidebar"] > div:first-child { padding-top: 1rem !important; }
+    .main { padding: 0rem 1rem; }
+    [data-testid="stMetricValue"] { font-size: 1.6rem; font-weight: 700; }
+    [data-testid="stMetricDelta"] { font-size: 0.9rem; }
+    .stTabs [data-baseweb="tab-list"] { gap: 8px; }
+    .stTabs [data-baseweb="tab"] { padding: 8px 20px; font-weight: 600; }
+    div[data-testid="stMetric"] {
+        border: 1px solid rgba(255,255,255,0.1);
+        border-radius: 8px;
+        padding: 12px 16px;
     }
-    /* Metric cards styling - works in both light and dark mode */
-    [data-testid="stMetricValue"] {
-        font-size: 1.8rem;
-        font-weight: 600;
-    }
-    [data-testid="stMetricLabel"] {
-        font-size: 1rem;
-        font-weight: 500;
-    }
-    [data-testid="stMetricDelta"] {
-        font-size: 0.9rem;
-    }
-    /* Remove the metric background that was causing issues */
-    div[data-testid="metric-container"] {
-        padding: 15px;
-        border-radius: 10px;
-        border: 1px solid rgba(128, 128, 128, 0.2);
-    }
-    h1 {
-        padding-bottom: 20px;
-    }
-    .reportview-container .main .block-container {
-        max-width: 95%;
-    }
-    </style>
+    .metric-card { border-radius: 8px; padding: 14px 18px; margin-bottom: 8px; }
+    .metric-card .metric-label { font-size: 0.85rem; color: rgba(255,255,255,0.6); margin-bottom: 4px; }
+    .metric-card .metric-value { font-size: 1.6rem; font-weight: 700; color: #FAFAFA; }
+    .metric-green { border: 1px solid rgba(0, 200, 83, 0.4); background: rgba(0, 200, 83, 0.08); }
+    .metric-red { border: 1px solid rgba(255, 23, 68, 0.4); background: rgba(255, 23, 68, 0.08); }
+</style>
+""", unsafe_allow_html=True)
+
+def colored_metric(label, value, color="green"):
+    css_class = "metric-green" if color == "green" else "metric-red"
+    st.markdown(f"""
+    <div class="metric-card {css_class}">
+        <div class="metric-label">{label}</div>
+        <div class="metric-value">{value}</div>
+    </div>
     """, unsafe_allow_html=True)
 
-# Title
-st.title("📈 Gamma Scalping Strategy Dashboard")
-st.markdown("### Interactive Backtesting & Analysis for Nifty Options")
+st.markdown("### ⚡ Nifty50 Gamma Scalp 1Min")
 
-# Sidebar - Strategy Configuration
-st.sidebar.header("⚙️ Strategy Configuration")
+# Sidebar
+st.sidebar.header("📂 Data & Filters", help="1-lot Nifty margin requirement (~₹1.75L)")
 
-# Strategy Presets
-st.sidebar.markdown("### Quick Presets")
-col1, col2, col3 = st.sidebar.columns(3)
+uploaded_file = st.sidebar.file_uploader("Upload Raw Options Data CSV", type=["csv"])
 
-if col1.button("Conservative", use_container_width=True):
-    st.session_state.preset = 'conservative'
-if col2.button("Aggressive", use_container_width=True):
-    st.session_state.preset = 'aggressive'
-if col3.button("High Freq", use_container_width=True):
-    st.session_state.preset = 'high_frequency'
+fee_override = st.sidebar.number_input(
+    "Fee Per Trade (₹)", value=20.0, min_value=0.0, step=5.0
+)
 
-# Initialize preset values
-if 'preset' not in st.session_state:
-    st.session_state.preset = None
+k_factor_override = st.sidebar.slider(
+    "Economic Gate (K-Factor)", min_value=1.0, max_value=10.0, value=float(DEFAULT_K), step=0.5,
+    help="Multiplier for the economic gate threshold."
+)
 
-# Set default values based on preset
-if st.session_state.preset == 'conservative':
-    default_delta = CONSERVATIVE['DELTA_THRESHOLD']
-    default_profit = CONSERVATIVE['PROFIT_TARGET']
-    default_loss = CONSERVATIVE['MAX_LOSS']
-    default_iv_entry = CONSERVATIVE['IV_ENTRY_PERCENTILE']
-elif st.session_state.preset == 'aggressive':
-    default_delta = AGGRESSIVE['DELTA_THRESHOLD']
-    default_profit = AGGRESSIVE['PROFIT_TARGET']
-    default_loss = AGGRESSIVE['MAX_LOSS']
-    default_iv_entry = AGGRESSIVE['IV_ENTRY_PERCENTILE']
-elif st.session_state.preset == 'high_frequency':
-    default_delta = HIGH_FREQUENCY['DELTA_THRESHOLD']
-    default_profit = HIGH_FREQUENCY['PROFIT_TARGET']
-    default_loss = HIGH_FREQUENCY['MAX_LOSS']
-    default_iv_entry = 30
+cooldown_override = st.sidebar.slider(
+    "Hedge Cooldown (Mins)", min_value=0, max_value=30, value=int(DEFAULT_COOLDOWN), step=1,
+    help="Minimum minutes between hedges."
+)
+
+# Hardcoded starting capital since it was removed from UI
+starting_capital = 175000
+
+# Data Loading & Backtest
+@st.cache_data(show_spinner="Running backtest engine...")
+def load_and_run(raw_df_bytes, fee, k_factor, cooldown):
+    raw_df = pd.read_csv(raw_df_bytes)
+    if 'date' in raw_df.columns:
+        raw_df['date'] = raw_df['date'].astype(str).str.replace(r'^="?|"$', '', regex=True).str.strip()
+    raw_df['date_parsed'] = pd.to_datetime(raw_df['date'], format='mixed', dayfirst=True).dt.date
+    total_raw_sessions = raw_df['date_parsed'].nunique()
+    df_trades, df_sessions = build_dataframes(raw_df, fee=fee, k_factor=k_factor, cooldown_min=cooldown)
+    n_processed_sessions = df_sessions['date'].nunique() if not df_sessions.empty else 0
+    removed_sessions = total_raw_sessions - n_processed_sessions
+    return df_trades, df_sessions, raw_df, removed_sessions
+
+using_synthetic = False
+default_file_path = "FINAL_NIFTY_MASTER_ATM.csv"
+
+if uploaded_file is not None:
+    df_trades, df_sessions, raw_df, removed_sessions = load_and_run(uploaded_file, fee_override, k_factor_override, cooldown_override)
+elif os.path.exists(default_file_path):
+    st.sidebar.success(f"📂 Loaded provided data ({default_file_path})")
+    df_trades, df_sessions, raw_df, removed_sessions = load_and_run(default_file_path, fee_override, k_factor_override, cooldown_override)
 else:
-    default_delta = 0.15
-    default_profit = 0.50
-    default_loss = -0.30
-    default_iv_entry = 30
+    st.sidebar.warning("⚠️ No CSV uploaded and default data not found. Using synthetic sample data.")
+    using_synthetic = True
+    raw_df = generate_synthetic_data(n_sessions=30)
+    df_trades, df_sessions = build_dataframes(raw_df, fee=fee_override, k_factor=k_factor_override, cooldown_min=cooldown_override)
+    removed_sessions = 0
 
-# Strategy Parameters
-st.sidebar.markdown("### Strategy Parameters")
+if using_synthetic:
+    st.warning("⚠️ Showing synthetic sample data. Upload your CSV to populate real results.")
 
-delta_threshold = st.sidebar.slider(
-    "Delta Threshold",
-    min_value=0.05,
-    max_value=0.30,
-    value=default_delta,
-    step=0.01,
-    help="Rehedge when |portfolio delta| exceeds this value"
-)
-
-iv_entry_percentile = st.sidebar.slider(
-    "IV Entry Percentile",
-    min_value=10,
-    max_value=50,
-    value=int(default_iv_entry),
-    step=5,
-    help="Enter position when IV is below this percentile"
-)
-
-iv_exit_percentile = st.sidebar.slider(
-    "IV Exit Percentile",
-    min_value=50,
-    max_value=90,
-    value=70,
-    step=5,
-    help="Exit position when IV exceeds this percentile"
-)
-
-profit_target = st.sidebar.slider(
-    "Profit Target (%)",
-    min_value=10,
-    max_value=100,
-    value=int(default_profit * 100),
-    step=5,
-    help="Exit at this profit % of premium paid"
-) / 100
-
-max_loss = st.sidebar.slider(
-    "Max Loss (%)",
-    min_value=-50,
-    max_value=-10,
-    value=int(default_loss * 100),
-    step=5,
-    help="Stop loss at this % of premium paid"
-) / 100
-
-time_to_expiry = st.sidebar.slider(
-    "Days to Expiry",
-    min_value=1,
-    max_value=21,
-    value=7,
-    step=1,
-    help="Option time to expiry in days"
-)
-
-risk_free_rate = st.sidebar.slider(
-    "Risk Free Rate (%)",
-    min_value=2.0,
-    max_value=10.0,
-    value=6.0,
-    step=0.5,
-    help="Annual risk-free rate for Greeks calculation"
-) / 100
-
-# Data Configuration
-st.sidebar.markdown("### Data Configuration")
-
-timeframe = st.sidebar.selectbox(
-    "Timeframe",
-    options=['1min', '3min', '5min'],
-    index=2,
-    help="Candlestick timeframe"
-)
-
-backtest_days = st.sidebar.slider(
-    "Backtest Days",
-    min_value=10,
-    max_value=90,
-    value=30,
-    step=5,
-    help="Number of days to backtest"
-)
-
-# Data source selection
-data_source_options = ["Generate Sample Data", "Upload CSV"]
-if API_AVAILABLE:
-    data_source_options.append("Fetch from NSE API")
-
-data_source = st.sidebar.radio(
-    "Data Source",
-    options=data_source_options,
-    help="Choose data source for backtesting"
-)
-
-uploaded_file = None
-api_start_date = None
-api_end_date = None
-
-if data_source == "Upload CSV":
-    uploaded_file = st.sidebar.file_uploader(
-        "Upload Nifty Price Data",
-        type=['csv'],
-        help="CSV should have: (date+time OR timestamp) and (close OR spot) columns. High/low optional."
+# Date range filter
+if not df_sessions.empty and 'date' in df_sessions.columns:
+    all_dates = pd.to_datetime(df_sessions['date']).dt.date
+    date_min, date_max = all_dates.min(), all_dates.max()
+    date_range = st.sidebar.date_input(
+        "Date Range Filter", value=[date_min, date_max],
+        min_value=date_min, max_value=date_max,
     )
-elif data_source == "Fetch from API (Yahoo Finance)":
-    st.sidebar.markdown("#### API Data Range")
-    
-    # Date range selector
-    col1, col2 = st.sidebar.columns(2)
-    with col1:
-        api_start_date = st.date_input(
-            "Start Date",
-            value=datetime.now().date() - timedelta(days=30),
-            max_value=datetime.now().date(),
-            help="Start date for API data"
-        )
-    with col2:
-        api_end_date = st.date_input(
-            "End Date",
-            value=datetime.now().date() - timedelta(days=1),
-            max_value=datetime.now().date(),
-            help="End date for API data"
-        )
-    
-    # Show info about API
-    st.sidebar.info(
-        "📡 **Market Data API**\n"
-        "- Using Yahoo Finance (yfinance)\n"
-        "- Free, no API key required\n"
-        "- Daily data (simulated to intraday)\n"
-        "- More reliable than NSE scraping"
-    )
+    if len(date_range) == 2:
+        mask = (all_dates >= date_range[0]) & (all_dates <= date_range[1])
+        df_sessions = df_sessions[mask.values].reset_index(drop=True)
+        if not df_trades.empty and 'date' in df_trades.columns:
+            trade_dates = pd.to_datetime(df_trades['date']).dt.date
+            trade_mask = (trade_dates >= date_range[0]) & (trade_dates <= date_range[1])
+            df_trades = df_trades[trade_mask.values].reset_index(drop=True)
 
-# Main content area
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
-    "📊 Dashboard", 
-    "📈 Charts", 
-    "📋 Trade Log", 
-    "🎯 Greeks Analysis",
-    "📖 Documentation"
+# Day type filter
+if not df_sessions.empty and 'day_type' in df_sessions.columns:
+    available_types = [t for t in df_sessions['day_type'].unique() if t != 'skipped']
+    day_type_filter = st.sidebar.multiselect(
+        "Day Type Filter", options=available_types, default=available_types,
+    )
+    if day_type_filter:
+        df_sessions_filtered = df_sessions[
+            (df_sessions['day_type'].isin(day_type_filter)) | (df_sessions['day_type'] == 'skipped')
+        ]
+    else:
+        df_sessions_filtered = df_sessions
+else:
+    df_sessions_filtered = df_sessions
+
+entered = df_sessions_filtered[df_sessions_filtered['session_entered'] == True] if not df_sessions_filtered.empty else pd.DataFrame()
+fired = df_trades[df_trades['was_blocked'] == False] if not df_trades.empty else pd.DataFrame()
+blocked = df_trades[df_trades['was_blocked'] == True] if not df_trades.empty else pd.DataFrame()
+
+
+if not entered.empty:
+    net_pnl = entered['net_pnl'].sum()
+    gross_pnl = entered['gross_pnl'].sum()
+    total_fees = entered['total_fees'].sum()
+    fee_drag = (total_fees / gross_pnl * 100) if gross_pnl != 0 else 0
+
+    total_hedges = int(entered['hedge_count'].sum())
+    n_sessions_entered = len(entered)
+    avg_hedges_day = total_hedges / n_sessions_entered if n_sessions_entered > 0 else 0
+    avg_pnl_hedge = net_pnl / total_hedges if total_hedges > 0 else 0
+
+    daily_pnls = entered['net_pnl'].values
+    sharpe = (np.mean(daily_pnls) / np.std(daily_pnls)) * np.sqrt(252) if len(daily_pnls) > 1 and np.std(daily_pnls) > 0 else 0
+    cum_pnl = np.cumsum(daily_pnls)
+    running_max = np.maximum.accumulate(cum_pnl)
+    drawdowns = cum_pnl - running_max
+    max_dd = np.min(drawdowns)
+    win_rate = (fired['net_pnl'] > 0).mean() * 100 if not fired.empty else 0
+
+    # Calmar = CAGR / Max DD
+    n_years = len(daily_pnls) / 252
+    cagr_pct = (net_pnl / starting_capital) / n_years * 100 if n_years > 0 else 0
+    calmar = abs(cagr_pct / (max_dd / starting_capital * 100)) if max_dd != 0 else 0
+
+    # Profit Factor = gross wins / gross losses
+    winning_pnl = daily_pnls[daily_pnls > 0].sum()
+    losing_pnl = abs(daily_pnls[daily_pnls < 0].sum())
+    profit_factor = winning_pnl / losing_pnl if losing_pnl > 0 else float('inf')
+
+    # Row 1: P&L
+    r1c1, r1c2, r1c3 = st.columns(3)
+    with r1c1: colored_metric("Net P&L After Fees", format_inr(net_pnl), "green")
+    with r1c2: colored_metric("Gross P&L Before Fees", format_inr(gross_pnl), "green")
+    with r1c3: colored_metric("Fee Drag %", f"{fee_drag:.1f}%", "red")
+
+    # Row 2: Risk-Adjusted Returns
+    r2c1, r2c2, r2c3 = st.columns(3)
+    with r2c1: colored_metric("Sharpe Ratio", f"{sharpe:.2f}", "green")
+    with r2c2: colored_metric("Calmar Ratio", f"{calmar:.2f}", "green")
+    with r2c3: colored_metric("Profit Factor", f"{profit_factor:.2f}", "green")
+
+    # Max consecutive losing sessions
+    max_consec_loss = 0
+    cs = 0
+    for p in daily_pnls:
+        if p < 0:
+            cs += 1
+            max_consec_loss = max(max_consec_loss, cs)
+        else:
+            cs = 0
+
+    # Row 3: Risk & Execution
+    r3c1, r3c2, r3c3, r3c4 = st.columns(4)
+    with r3c1: colored_metric("Max Drawdown", format_inr(max_dd), "red")
+    with r3c2: colored_metric("Max Consecutive Losers", str(max_consec_loss), "red")
+    with r3c3: colored_metric("Net Win Rate", f"{win_rate:.1f}%", "green")
+    with r3c4: colored_metric("Avg Net P&L/Hedge", format_inr(avg_pnl_hedge), "green")
+else:
+    st.info("No sessions entered. Adjust filters or upload data.")
+
+st.markdown("---")
+
+PLOTLY_TEMPLATE = "plotly_dark"
+
+tab1, tab2, tab3, tab4 = st.tabs([
+    "📈 P&L Analysis",
+    "🌍 Regime Breakdown",
+    "🔧 Param Robustness",
+    "📜 Hedge Log"
 ])
 
-# Run Backtest Button
-if st.sidebar.button("🚀 Run Backtest", type="primary", use_container_width=True):
-    with st.spinner("Running backtest... This may take a moment."):
-        try:
-            # Load or generate data
-            if data_source == "Fetch from API (Yahoo Finance)":
-                # Validate dates
-                if api_start_date >= api_end_date:
-                    st.sidebar.error("❌ Start date must be before end date")
-                    st.stop()
-                
-                # Initialize API fetcher (use yfinance by default)
-                fetcher = APIDataFetcher(use_yfinance=True)
-                
-                # Show progress
-                progress_text = st.empty()
-                progress_text.info(f"📡 Fetching data from Yahoo Finance ({api_start_date} to {api_end_date})...")
-                
-                try:
-                    # Fetch and format data
-                    price_data, metadata = fetcher.fetch_and_format(
-                        start_date=api_start_date,
-                        end_date=api_end_date,
-                        timeframe=timeframe,
-                        symbol="NIFTY 50"
-                    )
-                    
-                    progress_text.success(
-                        f"✅ Fetched {metadata['total_records']} records "
-                        f"({metadata['daily_records']} daily bars converted to {timeframe})"
-                    )
-                    
-                except Exception as e:
-                    progress_text.error(f"❌ API Error: {str(e)}")
-                    st.stop()
-            
-            elif data_source == "Upload CSV" and uploaded_file is not None:
-                price_data = pd.read_csv(uploaded_file)
-                
-                # Clean Excel formula format (="value") from all string columns
-                for col in price_data.columns:
-                    if price_data[col].dtype == 'object':  # String columns
-                        price_data[col] = price_data[col].astype(str).str.replace(r'^="|"$', '', regex=True)
-                
-                # Handle different column formats
-                # Case 1: Separate 'date' and 'time' columns -> combine into 'timestamp'
-                if 'date' in price_data.columns and 'time' in price_data.columns:
-                    price_data['timestamp'] = pd.to_datetime(
-                        price_data['date'].astype(str) + ' ' + price_data['time'].astype(str),
-                        format='%d-%m-%y %H:%M:%S'
-                    )
-                # Case 2: Single 'timestamp' column -> parse it
-                elif 'timestamp' in price_data.columns:
-                    price_data['timestamp'] = pd.to_datetime(price_data['timestamp'])
-                else:
-                    raise ValueError("CSV must have either 'timestamp' column or 'date' and 'time' columns")
-                
-                # Handle 'spot' column (use it as 'close' if 'close' doesn't exist)
-                if 'spot' in price_data.columns and 'close' not in price_data.columns:
-                    price_data['close'] = price_data['spot']
-                
-                # Verify required columns
-                required_cols = ['timestamp', 'close']
-                missing_cols = [col for col in required_cols if col not in price_data.columns]
-                if missing_cols:
-                    raise ValueError(f"CSV missing required columns: {', '.join(missing_cols)}")
-                
-                # Add high/low if not present (use close as fallback)
-                if 'high' not in price_data.columns:
-                    price_data['high'] = price_data['close'] * 1.001  # Approximate 0.1% higher
-                if 'low' not in price_data.columns:
-                    price_data['low'] = price_data['close'] * 0.999   # Approximate 0.1% lower
-                
-                # Keep only needed columns
-                price_data = price_data[['timestamp', 'close', 'high', 'low']].copy()
-                
-                # Sort by timestamp
-                price_data = price_data.sort_values('timestamp').reset_index(drop=True)
-                
-                # Data validation: Remove rows with zero, negative, or NaN prices
-                initial_rows = len(price_data)
-                price_data = price_data[
-                    (price_data['close'] > 0) & 
-                    (price_data['high'] > 0) & 
-                    (price_data['low'] > 0) &
-                    price_data['close'].notna() &
-                    price_data['high'].notna() &
-                    price_data['low'].notna()
-                ].reset_index(drop=True)
-                
-                if len(price_data) < initial_rows:
-                    st.sidebar.warning(f"⚠️ Removed {initial_rows - len(price_data)} rows with invalid prices")
-                
-                if len(price_data) == 0:
-                    st.sidebar.error("❌ No valid price data found after filtering")
-                    st.stop()
-                
-            else:
-                price_data = generate_sample_data(days=backtest_days, timeframe=timeframe)
-            
-            # Initialize strategy
-            strategy = GammaScalpingStrategy(
-                delta_threshold=delta_threshold,
-                iv_entry_percentile=iv_entry_percentile,
-                iv_exit_percentile=iv_exit_percentile,
-                profit_target=profit_target,
-                max_loss=max_loss,
-                time_to_expiry=time_to_expiry,
-                risk_free_rate=risk_free_rate
-            )
-            
-            # Run backtest
-            backtest_results = strategy.run_backtest(price_data)
-            
-            # Store in session state
-            st.session_state.price_data = price_data
-            st.session_state.backtest_results = backtest_results
-            st.session_state.trade_log = strategy.trade_log
-            st.session_state.pnl_history = strategy.pnl_history
-            st.session_state.strategy = strategy
-            
-            st.sidebar.success("✅ Backtest completed successfully!")
-            
-        except ZeroDivisionError as e:
-            import traceback
-            error_details = traceback.format_exc()
-            st.sidebar.error(f"❌ Division by zero error:\n```\n{error_details}\n```")
-            st.error("Division by zero error - see sidebar for details")
-        except Exception as e:
-            import traceback
-            error_details = traceback.format_exc()
-            st.sidebar.error(f"❌ Error running backtest: {str(e)}\n```\n{error_details}\n```")
-
-# Tab 1: Dashboard
+# Tab 1: P&L Analysis
 with tab1:
-    if 'backtest_results' in st.session_state and not st.session_state.backtest_results.empty:
-        results = st.session_state.backtest_results
-        trade_log = st.session_state.trade_log
-        pnl_history = st.session_state.pnl_history
-        
-        st.markdown("## 📊 Performance Summary")
-        
-        # Calculate metrics
-        trades_df = pd.DataFrame([t for t in trade_log if 'EXIT' in t.get('action', '')])
-        num_trades = len(trades_df)
-        
-        if num_trades > 0:
-            winning_trades = trades_df[trades_df['total_pnl'] > 0]
-            losing_trades = trades_df[trades_df['total_pnl'] <= 0]
-            
-            win_rate = len(winning_trades) / num_trades * 100
-            total_pnl = sum(pnl_history) if pnl_history else 0
-            avg_win = winning_trades['total_pnl'].mean() if len(winning_trades) > 0 else 0
-            avg_loss = losing_trades['total_pnl'].mean() if len(losing_trades) > 0 else 0
-            
-            # Correct profit factor: sum(profits) / abs(sum(losses))
-            total_wins = winning_trades['total_pnl'].sum() if len(winning_trades) > 0 else 0
-            total_losses = abs(losing_trades['total_pnl'].sum()) if len(losing_trades) > 0 else 0
-            profit_factor = total_wins / total_losses if total_losses != 0 else 0
-            
-            # Drawdown calculation
-            cumulative_pnl = results['total_pnl'].cumsum()
-            running_max = cumulative_pnl.expanding().max()
-            drawdown = cumulative_pnl - running_max
-            max_drawdown = drawdown.min()
-            
-            # Display metrics in columns
-            col1, col2, col3, col4, col5 = st.columns(5)
-            
-            with col1:
-                st.metric("Total P&L", f"₹{total_pnl:,.0f}", 
-                         delta=f"{(total_pnl/10000):.1f}% ROI" if total_pnl != 0 else None)
-            
-            with col2:
-                st.metric("Win Rate", f"{win_rate:.1f}%",
-                         delta=f"{len(winning_trades)}/{num_trades} trades")
-            
-            with col3:
-                st.metric("Profit Factor", f"{profit_factor:.2f}",
-                         delta="Good" if profit_factor > 1.5 else "Poor")
-            
-            with col4:
-                st.metric("Avg Win", f"₹{avg_win:,.0f}",
-                         delta=f"Avg Loss: ₹{avg_loss:,.0f}")
-            
-            with col5:
-                st.metric("Max Drawdown", f"₹{max_drawdown:,.0f}",
-                         delta=f"{(max_drawdown/total_pnl*100):.1f}%" if total_pnl != 0 else None,
-                         delta_color="inverse")
-            
-            # Trade breakdown
-            st.markdown("### Trade Breakdown")
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                st.markdown("#### Exit Reasons")
-                exit_reasons = trades_df['action'].value_counts()
-                fig_reasons = go.Figure(data=[
-                    go.Bar(
-                        x=[r.replace('EXIT_STRADDLE_', '') for r in exit_reasons.index],
-                        y=exit_reasons.values,
-                        marker_color=['green' if 'PROFIT' in r else 'red' if 'LOSS' in r else 'blue' 
-                                     for r in exit_reasons.index]
-                    )
-                ])
-                fig_reasons.update_layout(
-                    title="Exit Reasons Distribution",
-                    xaxis_title="Exit Reason",
-                    yaxis_title="Count",
-                    height=300
-                )
-                st.plotly_chart(fig_reasons, use_container_width=True)
-            
-            with col2:
-                st.markdown("#### P&L Distribution")
-                fig_dist = go.Figure(data=[
-                    go.Histogram(
-                        x=trades_df['total_pnl'],
-                        nbinsx=20,
-                        marker_color='rgba(31, 119, 180, 0.7)',
-                        name='P&L'
-                    )
-                ])
-                fig_dist.add_vline(x=0, line_dash="dash", line_color="red")
-                fig_dist.add_vline(x=trades_df['total_pnl'].mean(), 
-                                  line_dash="dash", line_color="green",
-                                  annotation_text=f"Mean: ₹{trades_df['total_pnl'].mean():.0f}")
-                fig_dist.update_layout(
-                    title="P&L Distribution",
-                    xaxis_title="P&L (₹)",
-                    yaxis_title="Frequency",
-                    height=300
-                )
-                st.plotly_chart(fig_dist, use_container_width=True)
-            
-            # Hedging statistics
-            hedges = [t for t in trade_log if t.get('action') == 'REHEDGE']
-            if hedges:
-                st.markdown("### Hedging Statistics")
-                col1, col2, col3 = st.columns(3)
-                
-                with col1:
-                    st.metric("Total Rehedges", len(hedges))
-                
-                with col2:
-                    avg_hedges = len(hedges) / num_trades if num_trades > 0 else 0
-                    st.metric("Avg Rehedges/Trade", f"{avg_hedges:.1f}")
-                
-                with col3:
-                    hedges_df = pd.DataFrame(hedges)
-                    avg_delta = hedges_df['portfolio_delta'].abs().mean()
-                    st.metric("Avg |Delta| at Rehedge", f"{avg_delta:.3f}")
-        
-        else:
-            st.info("No trades executed in this backtest. Try adjusting entry parameters.")
-    
+    if entered.empty:
+        st.info("No session data to display.")
     else:
-        st.info("👈 Configure parameters in the sidebar and click 'Run Backtest' to get started!")
-        
-        st.markdown("""
-        ### Welcome to Gamma Scalping Strategy Dashboard
-        
-        This application helps you backtest and analyze a gamma scalping (volatility scalping) 
-        strategy for Nifty options.
-        
-        **Quick Start:**
-        1. Use default parameters or select a preset (Conservative/Aggressive/High Frequency)
-        2. Adjust parameters in the sidebar as needed
-        3. Click "Run Backtest" to execute the strategy
-        4. Explore results across different tabs
-        
-        **Key Features:**
-        - Interactive parameter tuning
-        - Real-time backtesting
-        - Comprehensive performance metrics
-        - Detailed trade analysis
-        - Greeks visualization
-        - CSV export functionality
-        """)
+        st.subheader("Cumulative Equity Curve & Drawdown")
 
-# Tab 2: Charts
-with tab2:
-    if 'backtest_results' in st.session_state and not st.session_state.backtest_results.empty:
-        results = st.session_state.backtest_results
-        price_data = st.session_state.price_data
-        trade_log = st.session_state.trade_log
-        
-        st.markdown("## 📈 Interactive Charts")
-        
-        # Price chart with trades
-        st.markdown("### Price Chart with Entry/Exit Points")
-        
-        fig_price = go.Figure()
-        
-        # Price line
-        fig_price.add_trace(go.Scatter(
-            x=price_data['timestamp'],
-            y=price_data['close'],
-            mode='lines',
-            name='Nifty Spot',
-            line=dict(color='rgba(31, 119, 180, 0.8)', width=2)
-        ))
-        
-        # Entry points
-        entries = [t for t in trade_log if t['action'] == 'ENTER_STRADDLE']
-        if entries:
-            entry_times = [t['timestamp'] for t in entries]
-            entry_prices = [t['spot'] for t in entries]
-            fig_price.add_trace(go.Scatter(
-                x=entry_times,
-                y=entry_prices,
-                mode='markers',
-                name='Enter Straddle',
-                marker=dict(size=12, color='green', symbol='triangle-up')
+        cum_pnl_series = entered['net_pnl'].cumsum()
+        cum_pnl_arr = cum_pnl_series.values
+        running_max_arr = np.maximum.accumulate(cum_pnl_arr)
+        dd_arr = cum_pnl_arr - running_max_arr
+
+        col_eq, col_dd = st.columns(2)
+        with col_eq:
+            fig_cum = go.Figure()
+            fig_cum.add_trace(go.Scatter(
+                x=entered['date'].astype(str), y=cum_pnl_series,
+                mode='lines', name='Strategy',
+                line=dict(color='#00E5FF', width=2.5),
+                fill='tozeroy', fillcolor='rgba(0,229,255,0.15)',
+                hovertemplate="Date: %{x}<br>Cumulative: ₹%{y:,.0f}<extra></extra>"
             ))
-        
-        # Exit points
-        exits = [t for t in trade_log if 'EXIT' in t['action']]
-        if exits:
-            exit_times = [t['timestamp'] for t in exits]
-            exit_prices = [t['spot'] for t in exits]
-            exit_colors = ['red' if 'STOP_LOSS' in t['action'] else 'blue' for t in exits]
-            fig_price.add_trace(go.Scatter(
-                x=exit_times,
-                y=exit_prices,
-                mode='markers',
-                name='Exit Position',
-                marker=dict(size=12, color=exit_colors, symbol='triangle-down')
+            fig_cum.add_hline(y=0, line_dash="dash", line_color="grey", annotation_text="Breakeven")
+            fig_cum.update_layout(
+                template=PLOTLY_TEMPLATE,
+                xaxis_title="Date", yaxis_title="Cumulative Net P&L (₹)",
+                height=400, margin=dict(t=30)
+            )
+            st.plotly_chart(fig_cum, use_container_width=True)
+
+        with col_dd:
+            fig_dd = go.Figure()
+            fig_dd.add_trace(go.Scatter(
+                x=entered['date'].astype(str), y=dd_arr,
+                fill='tozeroy', fillcolor='rgba(255,23,68,0.3)',
+                line=dict(color='#FF1744', width=2), name='Drawdown',
+                hovertemplate="Date: %{x}<br>Drawdown: ₹%{y:,.0f}<extra></extra>"
             ))
-        
-        fig_price.update_layout(
-            title="Nifty Price with Trade Markers",
-            xaxis_title="Time",
-            yaxis_title="Price (₹)",
-            hovermode='x unified',
-            height=500
-        )
-        st.plotly_chart(fig_price, use_container_width=True)
-        
-        # Cumulative P&L with Drawdown
-        st.markdown("### Cumulative P&L and Drawdown")
-        
-        cumulative_pnl = results['total_pnl'].cumsum()
-        running_max = cumulative_pnl.expanding().max()
-        drawdown = cumulative_pnl - running_max
-        
-        fig_pnl = make_subplots(
-            rows=2, cols=1,
-            shared_xaxes=True,
-            vertical_spacing=0.05,
-            subplot_titles=("Cumulative P&L", "Drawdown"),
-            row_heights=[0.7, 0.3]
-        )
-        
-        # Cumulative P&L
-        fig_pnl.add_trace(
-            go.Scatter(
-                x=results['timestamp'],
-                y=cumulative_pnl,
-                name='Cumulative P&L',
-                line=dict(color='green', width=2),
-                fill='tozeroy',
-                fillcolor='rgba(0, 255, 0, 0.1)'
-            ),
-            row=1, col=1
-        )
-        
-        # Drawdown
-        fig_pnl.add_trace(
-            go.Scatter(
-                x=results['timestamp'],
-                y=drawdown,
-                name='Drawdown',
-                line=dict(color='red', width=2),
-                fill='tozeroy',
-                fillcolor='rgba(255, 0, 0, 0.1)'
-            ),
-            row=2, col=1
-        )
-        
-        fig_pnl.update_xaxes(title_text="Time", row=2, col=1)
-        fig_pnl.update_yaxes(title_text="P&L (₹)", row=1, col=1)
-        fig_pnl.update_yaxes(title_text="Drawdown (₹)", row=2, col=1)
-        fig_pnl.update_layout(height=600, hovermode='x unified')
-        
-        st.plotly_chart(fig_pnl, use_container_width=True)
-        
-        # Portfolio Delta
-        st.markdown("### Portfolio Delta Control")
-        
-        fig_delta = go.Figure()
-        
-        fig_delta.add_trace(go.Scatter(
-            x=results['timestamp'],
-            y=results['portfolio_delta'],
-            name='Portfolio Delta',
-            line=dict(color='purple', width=2)
-        ))
-        
-        fig_delta.add_hline(y=0, line_dash="dash", line_color="black", opacity=0.5)
-        fig_delta.add_hline(y=delta_threshold, line_dash="dash", line_color="red", 
-                           annotation_text="Rehedge Threshold")
-        fig_delta.add_hline(y=-delta_threshold, line_dash="dash", line_color="red")
-        
-        # Add shaded region for neutral zone
-        fig_delta.add_hrect(
-            y0=-delta_threshold, y1=delta_threshold,
-            fillcolor="green", opacity=0.1,
-            layer="below", line_width=0,
-        )
-        
-        fig_delta.update_layout(
-            title="Portfolio Delta (Target: Delta-Neutral)",
-            xaxis_title="Time",
-            yaxis_title="Delta",
-            hovermode='x unified',
-            height=400
-        )
-        
-        st.plotly_chart(fig_delta, use_container_width=True)
-        
-    else:
-        st.info("Run a backtest to view charts")
+            max_dd_idx = np.argmin(dd_arr)
+            fig_dd.add_annotation(
+                x=entered['date'].astype(str).iloc[max_dd_idx], y=dd_arr[max_dd_idx],
+                text=f"Max DD: {format_inr(dd_arr[max_dd_idx])}",
+                showarrow=True, arrowhead=2, arrowcolor='white',
+                font=dict(color='white', size=11)
+            )
+            fig_dd.update_layout(
+                template=PLOTLY_TEMPLATE,
+                xaxis_title="Date", yaxis_title="Drawdown (₹)",
+                height=400, margin=dict(t=30)
+            )
+            st.plotly_chart(fig_dd, use_container_width=True)
 
-# Tab 3: Trade Log
-with tab3:
-    if 'trade_log' in st.session_state and st.session_state.trade_log:
-        st.markdown("## 📋 Detailed Trade Log")
-        
-        trade_log_df = pd.DataFrame(st.session_state.trade_log)
-        
-        # Format display
-        if 'timestamp' in trade_log_df.columns:
-            trade_log_df['timestamp'] = pd.to_datetime(trade_log_df['timestamp']).dt.strftime('%Y-%m-%d %H:%M')
-        
-        # Display trade log
-        st.dataframe(
-            trade_log_df,
-            use_container_width=True,
-            height=600
-        )
-        
-        # Download button
-        csv = trade_log_df.to_csv(index=False)
-        st.download_button(
-            label="📥 Download Trade Log CSV",
-            data=csv,
-            file_name=f"gamma_scalping_trades_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-            mime="text/csv",
-            use_container_width=True
-        )
-        
-    else:
-        st.info("Run a backtest to view trade log")
+        st.markdown("---")
 
-# Tab 4: Greeks Analysis
+        # Economic Gate Analysis
+        if not fired.empty or not blocked.empty:
+            st.subheader("Economic Gate Analysis")
+            gate_data = []
+            if not fired.empty:
+                gate_data.append({
+                    'Category': 'Hedges Fired', 'Count': len(fired),
+                    'Avg Expected Capture (₹)': f'₹{fired["expected_capture"].mean():,.0f}',
+                    'Avg Actual Capture (₹)': f'₹{fired["actual_capture"].mean():,.0f}',
+                    'Avg Net P&L (₹)': f'₹{fired["net_pnl"].mean():,.0f}',
+                })
+            if not blocked.empty:
+                gate_data.append({
+                    'Category': 'Hedges Blocked by Gate', 'Count': len(blocked),
+                    'Avg Expected Capture (₹)': f'₹{blocked["blocked_expected_capture"].mean():,.0f}',
+                    'Avg Actual Capture (₹)': 'N/A', 'Avg Net P&L (₹)': 'N/A',
+                })
+            if gate_data:
+                st.table(pd.DataFrame(gate_data))
+
+        # Performance by Time Band
+        if not fired.empty and 'session_time_band' in fired.columns:
+            st.subheader("Performance by Time Band")
+            band_agg = fired.groupby('session_time_band').agg(
+                count=('net_pnl', 'count'),
+                avg_pnl=('net_pnl', 'mean'),
+                win_rate=('net_pnl', lambda x: (x > 0).mean() * 100)
+            ).reset_index()
+
+            fig_band = go.Figure()
+            fig_band.add_trace(go.Bar(
+                x=band_agg['session_time_band'], y=band_agg['avg_pnl'],
+                marker_color=['#00C853' if x > 0 else '#FF1744' for x in band_agg['avg_pnl']],
+                text=[f"n={c}, WR={w:.0f}%" for c, w in zip(band_agg['count'], band_agg['win_rate'])],
+                textposition='outside',
+            ))
+            fig_band.update_layout(
+                template=PLOTLY_TEMPLATE,
+                xaxis_title="Time Band", yaxis_title="Avg Net P&L (₹)",
+                height=350, margin=dict(t=30)
+            )
+            st.plotly_chart(fig_band, use_container_width=True)
+
+        # Greeks Analysis
+        if not fired.empty and 'net_delta' in fired.columns:
+            st.subheader("Greeks Analysis: Delta Distribution & P&L at Hedge")
+            col_greek1, col_greek2 = st.columns([3, 1])
+            with col_greek1:
+                tab_g1, tab_g2 = st.tabs(["Delta vs Capture", "Delta vs Net P&L"])
+                with tab_g1:
+                    fig_greeks1 = px.scatter(
+                        fired, x='net_delta', y='expected_capture', color='trigger_type',
+                        template=PLOTLY_TEMPLATE, height=350,
+                        labels={'net_delta': 'Net Delta', 'expected_capture': 'Expected Capture (₹)', 'trigger_type': 'Trigger'},
+                        title="Hedge Triggers: Delta vs Capture Size"
+                    )
+                    fig_greeks1.add_vline(x=0, line_dash="dash", line_color="rgba(255,255,255,0.3)")
+                    st.plotly_chart(fig_greeks1, use_container_width=True)
+                with tab_g2:
+                    fig_greeks2 = px.scatter(
+                        fired, x='net_delta', y='net_pnl', color='trigger_type',
+                        template=PLOTLY_TEMPLATE, height=350,
+                        labels={'net_delta': 'Net Delta', 'net_pnl': 'Net P&L (₹)', 'trigger_type': 'Trigger'},
+                        title="Hedge Triggers: Delta vs Net P&L"
+                    )
+                    fig_greeks2.add_vline(x=0, line_dash="dash", line_color="rgba(255,255,255,0.3)")
+                    fig_greeks2.add_hline(y=0, line_dash="dash", line_color="grey", annotation_text="Breakeven")
+                    st.plotly_chart(fig_greeks2, use_container_width=True)
+            with col_greek2:
+                st.metric("Avg Abs Delta at Hedge", f"{fired['net_delta'].abs().mean():.3f}")
+                st.metric("Max Abs Delta Hit", f"{fired['net_delta'].abs().max():.3f}")
+                
+        st.markdown("---")
+
+        # Slippage Sensitivity
+        st.subheader("Slippage Sensitivity")
+        total_hedges_all = int(entered['hedge_count'].sum())
+        baseline_pnl = entered['net_pnl'].sum()
+        extra_15x = total_hedges_all * (fee_override * 0.5)
+        extra_2x = total_hedges_all * fee_override
+        pnl_15x = baseline_pnl - extra_15x
+        pnl_2x = baseline_pnl - extra_2x
+
+        sc1, sc2, sc3 = st.columns(3)
+        sc1.metric(f"Baseline (₹{fee_override})", format_inr(baseline_pnl))
+        sc2.metric(f"1.5× Fee (₹{int(fee_override*1.5)})", format_inr(pnl_15x),
+                   delta=format_inr(pnl_15x - baseline_pnl))
+        sc3.metric(f"2× Fee (₹{fee_override*2})", format_inr(pnl_2x),
+                   delta=format_inr(pnl_2x - baseline_pnl))
+
+        if pnl_2x < 0:
+            st.error("⚠️ Strategy turns unprofitable at 2× slippage.")
+
+        st.markdown("---")
+
+        # Best 5 vs Worst 5
+        st.subheader("Best 5 vs Worst 5 Sessions")
+        display_cols = ['date', 'net_pnl', 'hedge_count', 'entry_iv', 'rv_iv_ratio', 'day_type', 'exit_reason']
+        avail_cols = [c for c in display_cols if c in entered.columns]
+
+        col_best, col_worst = st.columns(2)
+        with col_best:
+            st.markdown("**🟢 Best 5 Sessions**")
+            best5 = entered.nlargest(5, 'net_pnl')[avail_cols].copy()
+            best5['net_pnl'] = best5['net_pnl'].apply(format_inr)
+            st.table(best5)
+        with col_worst:
+            st.markdown("**🔴 Worst 5 Sessions**")
+            worst5 = entered.nsmallest(5, 'net_pnl')[avail_cols].copy()
+            worst5['net_pnl'] = worst5['net_pnl'].apply(format_inr)
+            st.table(worst5)
+
+# Tab 4: Hedge Log
 with tab4:
-    if 'backtest_results' in st.session_state and not st.session_state.backtest_results.empty:
-        results = st.session_state.backtest_results
-        
-        st.markdown("## 🎯 Greeks Analysis")
-        
-        # Gamma vs Theta
-        st.markdown("### Gamma (Edge) vs Theta (Cost)")
-        
-        fig_greeks = make_subplots(
-            rows=2, cols=1,
-            shared_xaxes=True,
-            vertical_spacing=0.1,
-            subplot_titles=("Gamma & Vega (Positive Exposure)", "Theta (Time Decay Cost)")
-        )
-        
-        # Gamma and Vega
-        fig_greeks.add_trace(
-            go.Scatter(
-                x=results['timestamp'],
-                y=results['gamma'],
-                name='Gamma',
-                line=dict(color='orange', width=2)
-            ),
-            row=1, col=1
-        )
-        
-        fig_greeks.add_trace(
-            go.Scatter(
-                x=results['timestamp'],
-                y=results['vega'],
-                name='Vega',
-                line=dict(color='purple', width=2)
-            ),
-            row=1, col=1
-        )
-        
-        # Theta
-        fig_greeks.add_trace(
-            go.Scatter(
-                x=results['timestamp'],
-                y=results['theta'],
-                name='Theta',
-                line=dict(color='red', width=2),
-                fill='tozeroy',
-                fillcolor='rgba(255, 0, 0, 0.1)'
-            ),
-            row=2, col=1
-        )
-        
-        fig_greeks.update_xaxes(title_text="Time", row=2, col=1)
-        fig_greeks.update_yaxes(title_text="Gamma / Vega", row=1, col=1)
-        fig_greeks.update_yaxes(title_text="Theta (Daily Decay)", row=2, col=1)
-        fig_greeks.update_layout(height=700, hovermode='x unified')
-        
-        st.plotly_chart(fig_greeks, use_container_width=True)
-        
-        # Cumulative Theta vs Total P&L
-        st.markdown("### Cumulative Theta Decay vs Total P&L")
-        
-        fig_theta_pnl = go.Figure()
-        
-        fig_theta_pnl.add_trace(go.Scatter(
-            x=results['timestamp'],
-            y=results['theta'].cumsum(),
-            name='Cumulative Theta (Cost)',
-            line=dict(color='red', width=2)
-        ))
-        
-        fig_theta_pnl.add_trace(go.Scatter(
-            x=results['timestamp'],
-            y=results['total_pnl'].cumsum(),
-            name='Total P&L',
-            line=dict(color='green', width=2)
-        ))
-        
-        fig_theta_pnl.add_hline(y=0, line_dash="dash", line_color="black", opacity=0.5)
-        
-        fig_theta_pnl.update_layout(
-            title="Theta Decay vs P&L (Must overcome theta to profit)",
-            xaxis_title="Time",
-            yaxis_title="Cumulative (₹)",
-            hovermode='x unified',
-            height=400
-        )
-        
-        st.plotly_chart(fig_theta_pnl, use_container_width=True)
-        
-        # P&L Components
-        st.markdown("### P&L Components Breakdown")
-        
-        trades_df = pd.DataFrame([t for t in st.session_state.trade_log if 'EXIT' in t.get('action', '')])
-        
-        if len(trades_df) > 0 and 'options_pnl' in trades_df.columns:
-            total_options_pnl = trades_df['options_pnl'].sum()
-            total_futures_pnl = trades_df['futures_pnl'].sum() if 'futures_pnl' in trades_df else 0
-            total_hedging_cost = trades_df['hedging_cost'].sum() if 'hedging_cost' in trades_df else 0
-            
-            col1, col2, col3 = st.columns(3)
-            
-            with col1:
-                st.metric("Options P&L", f"₹{total_options_pnl:,.0f}")
-            
-            with col2:
-                st.metric("Futures P&L (FIFO)", f"₹{total_futures_pnl:,.0f}")
-            
-            with col3:
-                st.metric("Hedging Cost (legacy)", f"₹{total_hedging_cost:,.0f}",
-                         help="Legacy field - not used. FIFO accounting already includes all hedge economics")
-            
-            # Pie chart (only options and futures, no hedging_cost as it's double counting)
-            fig_components = go.Figure(data=[go.Pie(
-                labels=['Options P&L', 'Futures P&L'],
-                values=[abs(total_options_pnl), abs(total_futures_pnl)],
-                hole=0.3
-            )])
-            
-            
-            fig_components.update_layout(
-                title="P&L Components (FIFO Accounting)",
-                height=400
-            )
-            
-            st.plotly_chart(fig_components, use_container_width=True)
-        
-        # 🎯 GREEKS P&L ATTRIBUTION (Professional Analysis)
-        if 'gamma_pnl' in results.columns:
-            st.markdown("### 🎯 Greeks P&L Attribution (Skill vs Luck)")
-            
-            # Calculate cumulative attribution
-            cum_gamma_pnl = results['gamma_pnl'].sum()
-            cum_vega_pnl = results['vega_pnl'].sum()
-            cum_theta_pnl = results['theta_pnl'].sum()
-            
-            # Display attribution metrics
-            col1, col2, col3 = st.columns(3)
-            
-            with col1:
-                st.metric("Gamma P&L (Skill)", f"₹{cum_gamma_pnl:,.0f}",
-                         help="Profits from price movement scalping - repeatable skill")
-            
-            with col2:
-                st.metric("Vega P&L (Luck)", f"₹{cum_vega_pnl:,.0f}",
-                         help="Profits from IV changes - market luck, not scalable")
-            
-            with col3:
-                st.metric("Theta P&L (Cost)", f"₹{cum_theta_pnl:,.0f}",
-                         help="Time decay cost - always negative")
-            
-            # Attribution analysis
-            total_options = cum_gamma_pnl + cum_vega_pnl + cum_theta_pnl
-            if abs(total_options) > 0:
-                gamma_pct = (cum_gamma_pnl / abs(total_options)) * 100
-                vega_pct = (cum_vega_pnl / abs(total_options)) * 100
-                theta_pct = (cum_theta_pnl / abs(total_options)) * 100
-                
-                if gamma_pct > 60:
-                    st.success(f"✅ **Skill-Based**: {gamma_pct:.1f}% from gamma scalping - strategy is working!")
-                elif vega_pct > 50:
-                    st.warning(f"⚠️ **Luck-Based**: {vega_pct:.1f}% from vega - not repeatable/scalable")
-                else:
-                    st.info(f"📊 Mixed: Gamma {gamma_pct:.1f}% | Vega {vega_pct:.1f}% | Theta {theta_pct:.1f}%")
-            
-            # Waterfall chart showing attribution
-            fig_waterfall = go.Figure(go.Waterfall(
-                name="P&L Attribution",
-                orientation="v",
-                measure=["relative", "relative", "relative", "total"],
-                x=["Gamma<br>(Scalping)", "Vega<br>(IV Change)", "Theta<br>(Decay)", "Total<br>Options P&L"],
-                y=[cum_gamma_pnl, cum_vega_pnl, cum_theta_pnl, 0],
-                connector={"line": {"color": "rgb(63, 63, 63)"}},
-                decreasing={"marker": {"color": "red"}},
-                increasing={"marker": {"color": "green"}},
-                totals={"marker": {"color": "blue"}}
-            ))
-            
-            fig_waterfall.update_layout(
-                title="Options P&L Attribution Waterfall",
-                yaxis_title="P&L (₹)",
-                height=400
-            )
-            
-            st.plotly_chart(fig_waterfall, use_container_width=True)
-        
-    else:
-        st.info("Run a backtest to view Greeks analysis")
+    st.subheader("Hedge Log")
+    display_trades = df_trades
+    if not display_trades.empty:
+        if 'date' in display_trades.columns:
+            dates_avail = display_trades['date'].unique()
+            selected_date = st.selectbox("Filter by Date", options=['All'] + list(dates_avail))
+            if selected_date != 'All':
+                display_trades = display_trades[display_trades['date'] == selected_date]
 
-# Tab 5: Documentation
-with tab5:
-    st.markdown("""
-    ## 📖 Gamma Scalping Strategy Documentation
-    
-    ### What is Gamma Scalping?
-    
-    Gamma scalping (also called volatility scalping) is a market-neutral options strategy that:
-    1. **Buys a straddle** (ATM call + ATM put) to gain positive gamma exposure
-    2. **Delta hedges** by trading futures to maintain delta neutrality
-    3. **Profits from volatility** when realized volatility exceeds implied volatility
-    
-    ### Core Principle
-    
-    **Profit = Realized Volatility - Implied Volatility - Transaction Costs - Theta Decay**
-    
-    ### Strategy Flow
-    
-    #### Entry
-    - Enter when IV is relatively low (below specified percentile)
-    - Buy ATM straddle (call + put at same strike)
-    - Initial position is approximately delta-neutral
-    
-    #### Delta Hedging
-    - Monitor portfolio delta continuously
-    - When |delta| exceeds threshold:
-        - **Positive delta**: Sell futures to neutralize
-        - **Negative delta**: Buy futures to neutralize
-    - This "scalps gamma" by buying low and selling high automatically
-    
-    #### Exit
-    - Profit target hit (e.g., 50% of premium paid)
-    - Stop loss hit (e.g., -30% of premium paid)
-    - IV spikes (volatility already realized)
-    - Time decay too high
-    
-    ### Parameter Guide
-    
-    #### Delta Threshold (0.05 - 0.30)
-    - **Lower (0.08-0.12)**: More frequent hedging, more opportunities, higher costs
-    - **Higher (0.15-0.20)**: Less hedging, lower costs, more directional risk
-    - **Recommended**: 0.15 as starting point
-    
-    #### IV Entry Percentile (10 - 50)
-    - **Lower (20-30)**: More selective, only cheap volatility
-    - **Higher (35-45)**: More trades, pay more for volatility
-    - **Recommended**: 25-35 for Nifty
-    
-    #### Profit Target (10% - 100%)
-    - **Conservative (30-40%)**: Quick profits, higher win rate
-    - **Aggressive (50-70%)**: Let winners run, lower win rate
-    - **Recommended**: 40-50% for weekly options
-    
-    #### Max Loss (-50% - -10%)
-    - **Tight (-20%)**: Limits losses, may exit early
-    - **Wide (-40%)**: Gives room, higher risk
-    - **Recommended**: -25% to -35%
-    
-    #### Days to Expiry (2 - 21)
-    - **Short (2-5)**: Higher gamma, higher theta, more active
-    - **Long (7-14)**: Lower gamma, lower theta, more stable
-    - **Recommended**: 5-7 days for good gamma/theta ratio
-    
-    ### Understanding the Greeks
-    
-    - **Delta (Δ)**: Directional exposure - aim to keep near zero
-    - **Gamma (Γ)**: Your edge - higher gamma = more scalping opportunities
-    - **Theta (Θ)**: Your cost - daily time decay to overcome
-    - **Vega (ν)**: IV sensitivity - profit if IV increases after entry
-    
-    ### When Strategy Works Best
-    
-    ✅ **Favorable Conditions:**
-    - IV is low but about to realize
-    - Choppy, range-bound markets
-    - Around events (earnings, policy decisions)
-    - Good gamma/theta ratio
-    
-    ❌ **Unfavorable Conditions:**
-    - IV already high (expensive options)
-    - Strong trending markets
-    - Very low volatility (insufficient movement)
-    - High transaction costs
-    
-    ### Risk Warnings
-    
-    ⚠️ **Key Risks:**
-    - **Gap Risk**: Overnight gaps can breach hedges
-    - **Theta Decay**: Time works against you daily
-    - **Transaction Costs**: Over-hedging destroys profits
-    - **Model Risk**: Black-Scholes assumptions may not hold
-    - **Execution Risk**: Slippage in fast markets
-    
-    ### Tips for Success
-    
-    1. **Start Conservative**: Use conservative preset initially
-    2. **Monitor Closely**: Watch real-time delta and gamma
-    3. **Control Costs**: Optimize delta threshold for your cost structure
-    4. **Test Thoroughly**: Backtest across different market conditions
-    5. **Paper Trade First**: Never start with live money
-    6. **Keep Records**: Track actual vs expected performance
-    7. **Adjust Parameters**: Fine-tune based on results
-    
-    ### References
-    
-    📚 **Recommended Reading:**
-    - "Dynamic Hedging" by Nassim Taleb
-    - "Option Volatility and Pricing" by Sheldon Natenberg
-    - "Volatility Trading" by Euan Sinclair
-    
-    ---
-    
-    **Disclaimer**: This is educational software for learning gamma scalping concepts. 
-    Options trading involves substantial risk and is not suitable for all investors. 
-    Test thoroughly with paper trading before risking real capital.
-    """)
+        log_cols = ['date', 'time', 'spot_at_hedge', 'net_delta', 'expected_capture',
+                   'actual_capture', 'fee', 'net_pnl', 'trigger_type',
+                   'session_time_band', 'was_blocked', 'blocked_reasons']
+        available_cols = [c for c in log_cols if c in display_trades.columns]
+        st.dataframe(
+            display_trades[available_cols].style.applymap(
+                lambda x: 'color: #00C853' if isinstance(x, (int, float)) and x > 0
+                else ('color: #FF1744' if isinstance(x, (int, float)) and x < 0 else ''),
+                subset=[c for c in ['net_pnl', 'actual_capture'] if c in available_cols]
+            ),
+            use_container_width=True, height=600
+        )
+
+# Tab 2: Regime Breakdown
+with tab2:
+    if entered.empty or 'day_type' not in entered.columns:
+        st.info("No regime data to display.")
+    else:
+        st.subheader("Regime Performance Summary")
+        regimes = entered.groupby('day_type').agg(
+            sessions=('net_pnl', 'count'),
+            avg_pnl=('net_pnl', 'mean'),
+            avg_hedges=('hedge_count', 'mean'),
+            total_pnl=('net_pnl', 'sum'),
+        ).reset_index()
+
+        regime_wr = entered.groupby('day_type')['net_pnl'].apply(
+            lambda x: (x > 0).mean() * 100
+        ).reset_index(name='win_rate')
+        regimes = regimes.merge(regime_wr, on='day_type')
+
+        fig_regime = make_subplots(specs=[[{"secondary_y": True}]])
+        fig_regime.add_trace(
+            go.Bar(x=regimes['day_type'], y=regimes['avg_pnl'],
+                   name='Avg Daily Net P&L (₹)',
+                   marker_color=['#00C853' if x > 0 else '#FF1744' for x in regimes['avg_pnl']]),
+            secondary_y=False
+        )
+        fig_regime.add_trace(
+            go.Scatter(x=regimes['day_type'], y=regimes['win_rate'],
+                       name='Win Rate %', mode='lines+markers',
+                       line=dict(color='#FFAB00', width=3)),
+            secondary_y=True
+        )
+        fig_regime.update_layout(template=PLOTLY_TEMPLATE, height=400, margin=dict(t=30))
+        fig_regime.update_yaxes(title_text="Avg P&L (₹)", secondary_y=False)
+        fig_regime.update_yaxes(title_text="Win Rate %", secondary_y=True)
+        st.plotly_chart(fig_regime, use_container_width=True)
+
+        st.subheader("Regime Summary Table")
+        display_regimes = regimes.copy()
+        display_regimes['avg_pnl'] = display_regimes['avg_pnl'].apply(lambda x: format_inr(x))
+        display_regimes['total_pnl'] = display_regimes['total_pnl'].apply(lambda x: format_inr(x))
+        display_regimes['win_rate'] = display_regimes['win_rate'].apply(lambda x: f"{x:.1f}%")
+        display_regimes['avg_hedges'] = display_regimes['avg_hedges'].apply(lambda x: f"{x:.1f}")
+        st.table(display_regimes)
+
+        # RV/IV Ratio vs P&L
+        st.subheader("RV/IV Ratio vs Session P&L")
+        if 'rv_iv_ratio' in entered.columns:
+            fig_rv = px.scatter(
+                entered, x='rv_iv_ratio', y='net_pnl', color='day_type',
+                template=PLOTLY_TEMPLATE,
+                labels={'rv_iv_ratio': 'RV/IV Ratio', 'net_pnl': 'Net P&L (₹)'},
+                height=400,
+            )
+            valid = entered[['rv_iv_ratio', 'net_pnl']].dropna()
+            if len(valid) > 2:
+                coeffs = np.polyfit(valid['rv_iv_ratio'], valid['net_pnl'], 1)
+                x_range = np.linspace(valid['rv_iv_ratio'].min(), valid['rv_iv_ratio'].max(), 50)
+                y_trend = np.polyval(coeffs, x_range)
+                fig_rv.add_trace(go.Scatter(
+                    x=x_range, y=y_trend, mode='lines',
+                    name=f'Trend (slope={coeffs[0]:.0f})',
+                    line=dict(color='white', width=2, dash='dash')
+                ))
+            st.plotly_chart(fig_rv, use_container_width=True)
+
+        # Weekday & Expiry Analysis
+        st.markdown("---")
+        st.subheader("📅 Weekday & Expiry Analysis")
+
+        if 'day_of_week' in entered.columns:
+            day_order = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri']
+            entered_dow = entered.copy()
+            entered_dow['day_of_week'] = pd.Categorical(
+                entered_dow['day_of_week'], categories=day_order, ordered=True
+            )
+
+            dow_agg = entered_dow.groupby('day_of_week', observed=True).agg(
+                sessions=('net_pnl', 'count'),
+                avg_pnl=('net_pnl', 'mean'),
+                total_pnl=('net_pnl', 'sum'),
+                avg_hedges=('hedge_count', 'mean'),
+            ).reset_index()
+
+            dow_wr = entered_dow.groupby('day_of_week', observed=True)['net_pnl'].apply(
+                lambda x: (x > 0).mean() * 100
+            ).reset_index(name='win_rate')
+            dow_agg = dow_agg.merge(dow_wr, on='day_of_week')
+
+            fig_dow = make_subplots(specs=[[{"secondary_y": True}]])
+            fig_dow.add_trace(
+                go.Bar(
+                    x=dow_agg['day_of_week'], y=dow_agg['avg_pnl'], name='Avg P&L (₹)',
+                    marker_color=['#FFD600' if d == 'Thu' else ('#00C853' if p > 0 else '#FF1744')
+                                  for d, p in zip(dow_agg['day_of_week'], dow_agg['avg_pnl'])],
+                    text=[f"n={n}" for n in dow_agg['sessions']],
+                    textposition='outside',
+                ),
+                secondary_y=False
+            )
+            fig_dow.add_trace(
+                go.Scatter(
+                    x=dow_agg['day_of_week'], y=dow_agg['win_rate'],
+                    name='Win Rate %', mode='lines+markers',
+                    line=dict(color='#00E5FF', width=3)
+                ),
+                secondary_y=True
+            )
+            fig_dow.update_layout(
+                template=PLOTLY_TEMPLATE, height=400, margin=dict(t=30),
+                title="P&L by Day of Week (Thursday = Expiry Day, highlighted yellow)"
+            )
+            fig_dow.update_yaxes(title_text="Avg P&L (₹)", secondary_y=False)
+            fig_dow.update_yaxes(title_text="Win Rate %", secondary_y=True)
+            st.plotly_chart(fig_dow, use_container_width=True)
+
+            st.subheader("Weekday Summary Table")
+            display_dow = dow_agg.copy()
+            display_dow['avg_pnl'] = display_dow['avg_pnl'].apply(lambda x: format_inr(x))
+            display_dow['total_pnl'] = display_dow['total_pnl'].apply(lambda x: format_inr(x))
+            display_dow['win_rate'] = display_dow['win_rate'].apply(lambda x: f"{x:.1f}%")
+            display_dow['avg_hedges'] = display_dow['avg_hedges'].apply(lambda x: f"{x:.1f}")
+            st.table(display_dow)
+
+            # Thursday vs Non-Thursday
+            if 'is_thursday' in entered.columns:
+                st.subheader("Thursday (Expiry) vs Other Days")
+                thu = entered[entered['is_thursday'] == True]
+                non_thu = entered[entered['is_thursday'] == False]
+
+                tc1, tc2, tc3, tc4 = st.columns(4)
+                tc1.metric("Thu Avg P&L", format_inr(thu['net_pnl'].mean()) if not thu.empty else "N/A")
+                tc2.metric("Other Avg P&L", format_inr(non_thu['net_pnl'].mean()) if not non_thu.empty else "N/A")
+                tc3.metric("Thu Win Rate", f"{(thu['net_pnl'] > 0).mean() * 100:.1f}%" if not thu.empty else "N/A")
+                tc4.metric("Other Win Rate", f"{(non_thu['net_pnl'] > 0).mean() * 100:.1f}%" if not non_thu.empty else "N/A")
+
+                tc5, tc6, tc7, tc8 = st.columns(4)
+                tc5.metric("Thu Sessions", len(thu))
+                tc6.metric("Other Sessions", len(non_thu))
+                tc7.metric("Thu Total P&L", format_inr(thu['net_pnl'].sum()) if not thu.empty else "N/A")
+                tc8.metric("Other Total P&L", format_inr(non_thu['net_pnl'].sum()) if not non_thu.empty else "N/A")
+
+                tc9, tc10 = st.columns(2)
+                tc9.metric("Thu Avg Hedges/Day", f"{thu['hedge_count'].mean():.1f}" if not thu.empty else "N/A")
+                tc10.metric("Other Avg Hedges/Day", f"{non_thu['hedge_count'].mean():.1f}" if not non_thu.empty else "N/A")
+
+            # Days-to-Expiry P&L
+            if 'days_to_expiry' in entered.columns:
+                st.subheader("P&L by Days to Thursday Expiry")
+                dte_agg = entered.groupby('days_to_expiry').agg(
+                    sessions=('net_pnl', 'count'),
+                    avg_pnl=('net_pnl', 'mean'),
+                    total_pnl=('net_pnl', 'sum'),
+                ).reset_index()
+                dte_agg['day_label'] = dte_agg['days_to_expiry'].map({
+                    0: 'Thu (0)', 1: 'Wed (1)', 2: 'Tue (2)', 3: 'Mon (3)', 4: 'Fri (4)',
+                })
+
+                fig_dte = go.Figure(go.Bar(
+                    x=dte_agg['day_label'], y=dte_agg['avg_pnl'],
+                    marker_color=['#FFD600' if d == 0 else ('#00C853' if p > 0 else '#FF1744')
+                                  for d, p in zip(dte_agg['days_to_expiry'], dte_agg['avg_pnl'])],
+                    text=[f"n={n}, total={format_inr(t)}" for n, t in zip(dte_agg['sessions'], dte_agg['total_pnl'])],
+                    textposition='outside',
+                ))
+                fig_dte.update_layout(
+                    template=PLOTLY_TEMPLATE, height=400, margin=dict(t=30),
+                    xaxis_title="Days to Thursday Expiry",
+                    yaxis_title="Avg Session P&L (₹)",
+                    title="Does proximity to expiry affect P&L?"
+                )
+                st.plotly_chart(fig_dte, use_container_width=True)
+
+# Tab 3: Parameter Robustness
+with tab3:
+    st.subheader("Parameter Robustness Heatmap")
+    run_sweeps = st.button("🔬 Generate Robustness Heatmap", type="primary")
+
+    if run_sweeps:
+        with st.spinner("Generating K × Cooldown heatmap..."):
+            k_sweep = [3.0, 3.5, 4.0, 4.5, 5.0, 5.5, 6.0]
+            cd_sweep = [5, 7, 9, 11, 13, 15]
+            heatmap_results = run_2d_sweep(
+                raw_df, 'k_factor', k_sweep, 'cooldown_min', cd_sweep
+            )
+
+        if not heatmap_results.empty:
+            st.subheader("K × Cooldown Heatmap (Sharpe Ratio)")
+            pivot = heatmap_results.pivot(index='param1', columns='param2', values='sharpe')
+            fig_hm = go.Figure(go.Heatmap(
+                z=pivot.values,
+                x=[str(c) for c in pivot.columns],
+                y=[str(r) for r in pivot.index],
+                colorscale='RdYlGn',
+                text=np.round(pivot.values, 2),
+                texttemplate='%{text}',
+                hovertemplate='K=%{y}, Cooldown=%{x}min<br>Sharpe: %{z:.2f}<extra></extra>'
+            ))
+            fig_hm.update_layout(
+                template=PLOTLY_TEMPLATE,
+                xaxis_title="Cooldown (min)", yaxis_title="K Factor",
+                height=450, margin=dict(t=30),
+                title="Parameter Grid: Sharpe Ratio by K Factor × Cooldown"
+            )
+            st.plotly_chart(fig_hm, use_container_width=True)
 
 # Footer
 st.markdown("---")
-st.markdown("""
-    <div style='text-align: center; color: #666; padding: 20px;'>
-        <p>Gamma Scalping Strategy Dashboard v1.0</p>
-        <p>For educational purposes only. Trade at your own risk.</p>
-    </div>
-    """, unsafe_allow_html=True)
+st.markdown(
+    "<div style='text-align: center; color: grey; font-size: 0.8em;'>"
+    "Nifty50 Gamma Scalp 1Min — V1.0"
+    "</div>",
+    unsafe_allow_html=True
+)

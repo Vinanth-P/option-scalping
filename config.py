@@ -1,120 +1,123 @@
 """
-Configuration file for Gamma Scalping Strategy
-
-Modify these parameters to customize the strategy behavior
+Configuration — Nifty50 Gamma Scalp Strategy Parameters
 """
 
-# ============================================================================
-# STRATEGY PARAMETERS
-# ============================================================================
+# Entry Conditions
+RV_WINDOW_DAYS = 5
+RV_IV_EDGE_MIN = 0.05
+RV_IV_EDGE_MAX = 0.10
+IV_ENTRY_PERCENTILE = 65
 
-# Delta Hedging Parameters
-DELTA_THRESHOLD = 0.15          # Rehedge when |portfolio delta| > 0.15
-                                # Lower = more frequent hedging = higher transaction costs
-                                # Higher = less frequent hedging = more directional risk
+# Delta Hedging
+DELTA_HEDGE_BAND = 0.25
+SPOT_MOVE_THRESHOLD = 0.0025
 
-# Entry/Exit Conditions
-IV_ENTRY_PERCENTILE = 30        # Enter when IV below 30th percentile (low IV)
-IV_EXIT_PERCENTILE = 70         # Exit when IV above 70th percentile (high IV)
-PROFIT_TARGET = 0.50            # Exit at 50% profit on premium paid
-MAX_LOSS = -0.30                # Stop loss at -30% of premium paid
+# Retail-Hardened Filters
+FIRST_15M_MOVE_THRESHOLD = 0.0020   # Min first-15-min move to enter
+ROUND_TRIP_COST = 285.0              # Estimated round-trip cost (fees + slippage)
+ECONOMIC_MULTIPLIER = 4.0            # Hedge only if capture >= K× cost
+HEDGE_COOLDOWN_MINUTES = 7
+MAX_DAILY_HEDGES = 30
+
+# Intraday Variance Checkpoints
+NOON_RV_THRESHOLD = 0.45            # 12:30 PM: reduce 50% if RV < 45% of IV
+AFTERNOON_RV_THRESHOLD = 0.70       # 2:30 PM: exit if RV < 70% of IV
+
+# P&L Exits
+PROFIT_TARGET = 0.50
+MAX_LOSS = -0.30
+
+# Volatility Exits
+IV_DROP_EXIT = 0.08
+
+# Directional Pinning Exit
+DELTA_PIN_THRESHOLD = 0.50
+DELTA_PIN_DURATION_MINUTES = 30
 
 # Option Parameters
-TIME_TO_EXPIRY = 7              # Days to expiry (7 = weekly options)
-RISK_FREE_RATE = 0.06           # Annual risk-free rate (6%)
-STRIKE_INTERVAL = 50            # Nifty strike interval (typically 50)
+TIME_TO_EXPIRY = 7
+RISK_FREE_RATE = 0.06
+STRIKE_INTERVAL = 50
 
-# ============================================================================
-# DATA PARAMETERS
-# ============================================================================
+# Data Parameters
+TIMEFRAME = '5min'
+BACKTEST_DAYS = 30
 
-TIMEFRAME = '5min'              # Options: '1min', '3min', '5min'
-BACKTEST_DAYS = 30              # Number of days to backtest
-
-# ============================================================================
-# RISK MANAGEMENT
-# ============================================================================
-
-MAX_POSITIONS = 1               # Maximum concurrent straddles
-POSITION_SIZE = 1               # Lot size multiplier (1 = 1 lot)
-
-# ============================================================================
-# ADVANCED PARAMETERS
-# ============================================================================
+# Risk Management
+MAX_POSITIONS = 1
+POSITION_SIZE = 1
 
 # Volatility Calculation
-HV_WINDOW = 20                  # Historical volatility lookback (bars)
-IV_HV_MULTIPLIER = 1.2          # IV typically trades at premium to HV
+HV_WINDOW = 20
+IV_HV_MULTIPLIER = 1.2
 
-# Transaction Costs (for live trading)
-FUTURES_COMMISSION = 20         # Per futures contract (₹)
-OPTIONS_COMMISSION = 50         # Per options contract (₹)
-SLIPPAGE_BPS = 5                # Slippage in basis points
+# Transaction Costs
+FUTURES_COMMISSION = 20
+OPTIONS_COMMISSION = 50
+SLIPPAGE_BPS = 5
 
-# Greeks Calculation
-MIN_GAMMA_THRESHOLD = 0.001     # Minimum gamma to maintain position
-MIN_TIME_VALUE = 10             # Minimum option time value (₹)
+# Greeks
+MIN_GAMMA_THRESHOLD = 0.001
+MIN_TIME_VALUE = 10
 
-# ============================================================================
-# STRATEGY VARIATIONS
-# ============================================================================
-
-# You can test different variations:
-
-# Conservative (Lower Risk, Lower Returns)
+# Strategy Presets
 CONSERVATIVE = {
-    'DELTA_THRESHOLD': 0.10,
+    'DELTA_HEDGE_BAND': 0.20,
+    'SPOT_MOVE_THRESHOLD': 0.002,
+    'RV_IV_EDGE_MIN': 0.07,
+    'RV_IV_EDGE_MAX': 0.12,
+    'IV_ENTRY_PERCENTILE': 55,
     'PROFIT_TARGET': 0.30,
     'MAX_LOSS': -0.20,
-    'IV_ENTRY_PERCENTILE': 25
+    'IV_DROP_EXIT': 0.06,
+    'FIRST_15M_MOVE_THRESHOLD': 0.0025,
+    'ROUND_TRIP_COST': 285.0,
+    'ECONOMIC_MULTIPLIER': 5.0,
+    'HEDGE_COOLDOWN_MINUTES': 10,
+    'MAX_DAILY_HEDGES': 20,
 }
 
-# Aggressive (Higher Risk, Higher Returns)
 AGGRESSIVE = {
-    'DELTA_THRESHOLD': 0.20,
+    'DELTA_HEDGE_BAND': 0.30,
+    'SPOT_MOVE_THRESHOLD': 0.003,
+    'RV_IV_EDGE_MIN': 0.03,
+    'RV_IV_EDGE_MAX': 0.15,
+    'IV_ENTRY_PERCENTILE': 70,
     'PROFIT_TARGET': 0.75,
     'MAX_LOSS': -0.40,
-    'IV_ENTRY_PERCENTILE': 35
+    'IV_DROP_EXIT': 0.10,
+    'FIRST_15M_MOVE_THRESHOLD': 0.0015,
+    'ROUND_TRIP_COST': 285.0,
+    'ECONOMIC_MULTIPLIER': 3.0,
+    'HEDGE_COOLDOWN_MINUTES': 5,
+    'MAX_DAILY_HEDGES': 40,
 }
 
-# High Frequency (More Trades, More Hedging)
-HIGH_FREQUENCY = {
-    'DELTA_THRESHOLD': 0.08,
-    'PROFIT_TARGET': 0.25,
-    'MAX_LOSS': -0.15,
-    'TIMEFRAME': '1min'
-}
-
-# ============================================================================
-# MARKET CONDITIONS
-# ============================================================================
-
-# Different parameters work better in different market conditions:
-
-# Low Volatility Environment
+# Market Condition Overrides
 LOW_VOL_PARAMS = {
-    'IV_ENTRY_PERCENTILE': 40,  # More lenient entry
-    'TIME_TO_EXPIRY': 14,        # Longer dated options
-    'DELTA_THRESHOLD': 0.12
+    'IV_ENTRY_PERCENTILE': 70,
+    'TIME_TO_EXPIRY': 14,
+    'DELTA_HEDGE_BAND': 0.20,
+    'RV_IV_EDGE_MIN': 0.03,
 }
 
-# High Volatility Environment  
 HIGH_VOL_PARAMS = {
-    'IV_ENTRY_PERCENTILE': 20,  # Very selective entry
-    'TIME_TO_EXPIRY': 3,         # Shorter dated options
-    'DELTA_THRESHOLD': 0.18      # Less frequent hedging
+    'IV_ENTRY_PERCENTILE': 50,
+    'TIME_TO_EXPIRY': 3,
+    'DELTA_HEDGE_BAND': 0.30,
+    'RV_IV_EDGE_MIN': 0.08,
 }
 
-# Trending Market
 TRENDING_PARAMS = {
-    'DELTA_THRESHOLD': 0.12,    # More frequent hedging
-    'PROFIT_TARGET': 0.40,       # Take profits quicker
-    'MAX_LOSS': -0.25
+    'DELTA_HEDGE_BAND': 0.20,
+    'DELTA_PIN_DURATION_MINUTES': 20,
+    'PROFIT_TARGET': 0.40,
+    'MAX_LOSS': -0.25,
 }
 
-# Range-Bound Market
 RANGE_BOUND_PARAMS = {
-    'DELTA_THRESHOLD': 0.18,    # Less hedging in low movement
-    'PROFIT_TARGET': 0.60,       # Let winners run
-    'MAX_LOSS': -0.35
+    'DELTA_HEDGE_BAND': 0.35,
+    'SPOT_MOVE_THRESHOLD': 0.004,
+    'PROFIT_TARGET': 0.60,
+    'MAX_LOSS': -0.35,
 }
