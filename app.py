@@ -104,6 +104,20 @@ else:
 st.sidebar.caption(data_source_label)
 
 st.sidebar.markdown("---")
+
+with st.sidebar.expander("📐 Position Sizing", expanded=False):
+    st.markdown("""
+| | |
+|---|---|
+| **Lot Size** | 50 units |
+| **Lots Traded** | 1 lot/session |
+| **Starting Capital** | ₹1,75,000 |
+| **Straddle Fee** | ₹80 (open+close) |
+| **Hedge Fee** | ₹20/trade |
+| **Max Hedges/Day** | 30 |
+| **Min Capture (K=6)** | ₹240/hedge |
+""")
+
 run_backtest = st.sidebar.button("▶ Run Backtest", type="primary", use_container_width=True)
 
 # Initialize session state
