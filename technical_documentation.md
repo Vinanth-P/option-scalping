@@ -31,10 +31,11 @@
    - 6.4 [Parameter Sweeps](#64-parameter-sweeps)
 7. [Streamlit Dashboard (app.py)](#7-streamlit-dashboard-apppy)
 8. [Configuration Parameters](#8-configuration-parameters)
-9. [Data Sources & Format](#9-data-sources--format)
-10. [Live Trading Template](#10-live-trading-template)
-11. [Performance Metrics Computed](#11-performance-metrics-computed)
-12. [Dependencies & Installation](#12-dependencies--installation)
+9. [Position Sizing & Capital Allocation](#9-position-sizing--capital-allocation)
+10. [Data Sources & Format](#10-data-sources--format)
+11. [Live Trading Template](#11-live-trading-template)
+12. [Performance Metrics Computed](#12-performance-metrics-computed)
+13. [Dependencies & Installation](#13-dependencies--installation)
 
 ---
 
@@ -726,7 +727,79 @@ All defaults are defined in `config.py` and `backtest_engine.py` constants:
 
 ---
 
-## 9. Data Sources & Format
+## 9. Position Sizing & Capital Allocation
+
+All position sizing is fixed at **1 lot** (50 units) per session. The strategy does not scale position size dynamically based on account equity.
+
+### 9.1 Starting Capital
+
+```
+Starting Capital:  ₹1,75,000
+Source:            app.py (hardcoded)
+Rationale:         Approximate margin required to hold a 1-lot ATM Nifty straddle
+                   + delta-hedge futures position on NSE
+```
+
+This capital figure is used **only** for performance metric calculations (CAGR, Calmar ratio, Total Return %). It is not used to size or scale trades.
+
+### 9.2 Straddle Position (Options)
+
+```
+Instrument:    ATM Nifty Weekly Call + Put (same strike)
+Lot Size:      50 units per lot
+Lots Traded:   1 lot
+Quantity:      50 units of each (CE + PE)
+
+Cost at entry: straddle_price × 50
+Example:       If straddle = ₹200 (CE ₹100 + PE ₹100)
+               Total premium = ₹200 × 50 = ₹10,000
+
+Note:          Actual premium varies with market IV.
+               ₹1,75,000 is the margin block, not the premium paid.
+```
+
+**Position Scaling** (`position_scale`): Defaults to `1.0`. Drops to `0.5` if the 12:30 PM variance checkpoint triggers a 50% position cut. This halves both the straddle P&L and hedge P&L for the rest of that session.
+
+### 9.3 Delta-Hedge Position (Futures)
+
+Each hedge trade is sized by the current portfolio delta:
+
+```
+Hedge Quantity = portfolio_delta × LOT_SIZE × position_scale
+               = portfolio_delta × 50 × position_scale
+
+Hedge P&L per trade:
+    hedge_pnl = delta × (spot_current - last_hedge_spot) × 50 × position_scale
+```
+
+Futures are traded in the current weekly Nifty contract. The hedge quantity is not rounded to whole lots in the backtest — it is treated as a continuous quantity proportional to delta.
+
+### 9.4 Fee Constants (from `backtest_engine.py`)
+
+| Constant | Value | Description |
+|----------|-------|-------------|
+| `LOT_SIZE` | 50 | Nifty lot size (units per lot) |
+| `DEFAULT_FEE` | ₹20 | Execution fee per hedge leg |
+| `STRADDLE_ENTRY_EXIT_FEE` | ₹80 | Brokerage for straddle open + close (₹20 × 4 legs) |
+| `GATE_BASIS_COST` | ₹40 | Economic gate threshold basis (round-trip hedge cost) |
+| `DEFAULT_K` | 6 | Gate multiplier (K × ₹40 = ₹240 minimum capture required) |
+| `DEFAULT_MAX_HEDGES` | 30 | Max hedge trades per session |
+
+### 9.5 Daily Cost Summary
+
+```
+Fixed cost per session:    ₹80   (straddle open + close brokerage)
+Variable cost per session: n_hedges × ₹20
+
+Worst-case fees (30 hedges): ₹80 + (30 × ₹20) = ₹680/day
+Typical fees (8 hedges):     ₹80 + (8 × ₹20)  = ₹240/day
+
+Break-even per hedge:   ≥ ₹240 expected capture (K=6 gate enforces this)
+```
+
+---
+
+## 10. Data Sources & Format
 
 ### Primary Dataset: `FINAL_NIFTY_MASTER_ATM.csv`
 
@@ -769,7 +842,7 @@ data = ticker.history(start=start_date, end=end_date, interval='1d')
 
 ---
 
-## 10. Live Trading Template
+## 11. Live Trading Template
 
 `live_trading_template.py` provides a scaffold for live deployment.
 
@@ -809,7 +882,7 @@ futures_sym = f"NFO:NIFTY{expiry_date}FUT"
 
 ---
 
-## 11. Performance Metrics Computed
+## 12. Performance Metrics Computed
 
 | Metric | Where Computed | Description |
 |--------|---------------|-------------|
@@ -833,7 +906,7 @@ futures_sym = f"NFO:NIFTY{expiry_date}FUT"
 
 ---
 
-## 12. Dependencies & Installation
+## 13. Dependencies & Installation
 
 ### requirements.txt
 ```
