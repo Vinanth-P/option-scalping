@@ -399,7 +399,7 @@ with tab4:
                    'session_time_band', 'was_blocked', 'blocked_reasons']
         available_cols = [c for c in log_cols if c in display_trades.columns]
         st.dataframe(
-            display_trades[available_cols].style.applymap(
+            display_trades[available_cols].style.map(
                 lambda x: 'color: #00C853' if isinstance(x, (int, float)) and x > 0
                 else ('color: #FF1744' if isinstance(x, (int, float)) and x < 0 else ''),
                 subset=[c for c in ['net_pnl', 'actual_capture'] if c in available_cols]
